@@ -468,7 +468,7 @@ class ParallelDownloader:
                 cr = r.headers.get("Content-Range")
                 return int(status) == 206 and cr is not None
         except Exception:
-            return False
+            return None  # transient error — unknown range support, don't destroy resume state
 
     def _nblocks(self):
         return (self.size + self.BLOCK - 1) // self.BLOCK if self.size > 0 else 0
@@ -545,6 +545,8 @@ class ParallelDownloader:
             pos = start
             with open(self.part, "r+b") as fh:
                 while True:
+                    if self._cancel.is_set():
+                        break
                     chunk = r.read(1024 * 256)
                     if not chunk:
                         break
@@ -561,6 +563,8 @@ class ParallelDownloader:
                             self._last_done = self.done
                             self._last_time = now
                     self._mark_completed_upto(start, pos - 1)
+            if self._cancel.is_set():
+                return  # cancelled mid-range — partial blocks already marked
             if pos - 1 != end:
                 raise DownloadError(f"short read: got {pos - start} of {end - start + 1} bytes")
             self._mark(start, end)
@@ -573,6 +577,7 @@ class ParallelDownloader:
 
         missing = []
         i = 0
+        CHUNK_BLOCKS = 32  # ~32 MiB per worker task — so fresh downloads actually parallelize
         while i < n:
             if self._bitmap[i]:
                 i += 1
@@ -580,7 +585,11 @@ class ParallelDownloader:
             s = i
             while i < n and not self._bitmap[i]:
                 i += 1
-            missing.append((s * self.BLOCK, min(i * self.BLOCK, self.size) - 1))
+            c = s
+            while c < i:
+                e = min(c + CHUNK_BLOCKS, i)
+                missing.append((c * self.BLOCK, min(e * self.BLOCK, self.size) - 1))
+                c = e
 
         if not missing:
             self._finalize()
@@ -604,10 +613,12 @@ class ParallelDownloader:
                 if progress_cb:
                     progress_cb(self.done, self.size, self.speed)
                 time.sleep(0.2)
-            for f in futs:
-                f.result()
+            try:
+                for f in futs:
+                    f.result()  # re-raise DownloadError
+            finally:
+                self._save_bitmap()  # persist progress even when a worker fails
 
-        self._save_bitmap()
         if self._cancel.is_set():
             raise DownloadError("cancelled")
         self._finalize()
@@ -653,12 +664,7 @@ class ParallelDownloader:
 
     def _finalize(self):
         if os.path.exists(self.part):
-            if os.path.exists(self.dest):
-                try:
-                    os.remove(self.dest)
-                except Exception:
-                    pass
-            os.replace(self.part, self.dest)
+            os.replace(self.part, self.dest)  # atomic overwrite — never pre-delete dest
         if os.path.exists(self.meta):
             try:
                 os.remove(self.meta)
@@ -667,7 +673,11 @@ class ParallelDownloader:
 
     def download(self, progress_cb=None, cancel_check=None):
         self._head()
-        self.supports_ranges = self._probe_ranges() if self.size > 0 else False
+        if self.size > 0:
+            probe = self._probe_ranges()
+            self.supports_ranges = True if probe is None else probe  # assume ranges on transient failure
+        else:
+            self.supports_ranges = False
         if not self.supports_ranges and os.path.exists(self.part):
             os.remove(self.part)
             if os.path.exists(self.meta):
