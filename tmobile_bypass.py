@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-T-Mobile Bypass — Windows utility
+Carrier Bypass — Windows utility
 =================================
 1. TTL/Hop-limit fix: makes tethered (hotspot) traffic look like phone-native
-   traffic so T-Mobile's 600 kbps hotspot cap doesn't apply.
+   traffic so your carrier's hotspot cap doesn't apply.
 2. Parallel-chunk downloader: grabs large files (AI models, etc.) at full
    bandwidth using multiple simultaneous connections with resume support.
 3. Download queue: line up multiple URLs, download them in order.
@@ -15,6 +15,9 @@ T-Mobile Bypass — Windows utility
 7. One-click "Bypass + Test": apply the fix, flush DNS, and measure before/after.
 8. Self-update: check GitHub for a new release and swap in the new build.
 9. System tray icon with quick toggles.
+10. Multi-carrier: auto-detect carrier via IP lookup, auto-detect hop count
+    via tracert, per-carrier throttle verdicts, and optional Windows
+    fingerprint hardening (NCSI beacons, metered Wi-Fi).
 
 Run as Administrator (the .exe requests elevation via manifest; the .py
 re-launches itself elevated). The TTL setting persists across reboots.
@@ -43,15 +46,460 @@ from urllib.error import URLError
 # ----------------------------------------------------------------------------
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-BYPASS_TTL = 65          # 64 + 1 hop for the phone
+BYPASS_TTL = 65          # legacy constant — kept for back-compat; live code uses bypass_ttl()
 DEFAULT_TTL = 128        # Windows default hop limit
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "Predator04/T-MobileBypass"
 GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO
 
 WIN = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000 if WIN else 0
+
+# ----------------------------------------------------------------------------
+# Carrier profile table
+# ----------------------------------------------------------------------------
+# phone_ttl is 64 for every current profile (Android + iOS both ship 64) but
+# the field is kept per-profile so a future carrier that differs can override.
+CARRIERS = {
+    "tmobile": {
+        "name": "T-Mobile",
+        "asn": ["AS21928"],
+        "match": ["t-mobile", "tmobile", "tmus"],
+        "phone_ttl": 64,
+        "throttle_kbps": 600,
+        "typical_allotment_gb": [15, 50],
+        "notes": "Hotspot drops to 3G-ish ~600 kbps after allotment.",
+    },
+    "att": {
+        "name": "AT&T",
+        "asn": ["AS20057"],
+        "match": ["at&t", "att mobility", "at t mobility", "cingular"],
+        "phone_ttl": 64,
+        "throttle_kbps": 128,
+        "typical_allotment_gb": [5, 60],
+        "notes": "Hotspot drops to 128 kbps after allotment.",
+    },
+    "verizon": {
+        "name": "Verizon",
+        "asn": ["AS6167"],
+        "match": ["verizon", "cellco"],
+        "phone_ttl": 64,
+        "throttle_kbps": 600,
+        "typical_allotment_gb": [5, 60],
+        "notes": "600 kbps after cap (3 Mbps on 5G UW plans).",
+    },
+    "visible": {
+        "name": "Visible (Verizon MVNO)",
+        "asn": ["AS6167"],
+        "match": ["visible"],
+        "phone_ttl": 64,
+        "throttle_kbps": 5000,
+        "typical_allotment_gb": [],
+        "notes": "5 Mbps baseline cap, unlimited-ish allotment.",
+    },
+    "metro": {
+        "name": "Metro by T-Mobile",
+        "asn": ["AS21928"],
+        "match": ["metro", "metropcs"],
+        "phone_ttl": 64,
+        "throttle_kbps": 600,
+        "typical_allotment_gb": [5, 15],
+        "notes": "600 kbps after allotment.",
+    },
+    "cricket": {
+        "name": "Cricket (AT&T MVNO)",
+        "asn": ["AS20057"],
+        "match": ["cricket"],
+        "phone_ttl": 64,
+        "throttle_kbps": 128,
+        "typical_allotment_gb": [15],
+        "notes": "128 kbps after allotment.",
+    },
+    "mint": {
+        "name": "Mint Mobile (T-Mobile MVNO)",
+        "asn": ["AS21928"],
+        "match": ["mint mobile", "mint"],
+        "phone_ttl": 64,
+        "throttle_kbps": 128,
+        "typical_allotment_gb": [5, 10],
+        "notes": "128 kbps after allotment.",
+    },
+    "usmobile": {
+        "name": "US Mobile",
+        "asn": ["AS21928", "AS6167"],
+        "match": ["us mobile", "usmobile"],
+        "phone_ttl": 64,
+        "throttle_kbps": 600,
+        "typical_allotment_gb": [10, 50],
+        "notes": "600 kbps after allotment.",
+    },
+    "googlefi": {
+        "name": "Google Fi",
+        "asn": ["AS21928"],
+        "match": ["google fi", "google-fi", "googlefi", "project fi"],
+        "phone_ttl": 64,
+        "throttle_kbps": 256,
+        "typical_allotment_gb": [5, 50],
+        "notes": "256 kbps after allotment.",
+    },
+    "straighttalk": {
+        "name": "Straight Talk / TracFone",
+        "asn": ["AS21928", "AS6167"],
+        "match": ["straight talk", "straighttalk", "tracfone"],
+        "phone_ttl": 64,
+        "throttle_kbps": 128,
+        "typical_allotment_gb": [10],
+        "notes": "128 kbps after allotment.",
+    },
+    "boost": {
+        "name": "Boost Mobile",
+        "asn": ["AS6167"],
+        "match": ["boost mobile", "boost"],
+        "phone_ttl": 64,
+        "throttle_kbps": 512,
+        "typical_allotment_gb": [12, 30],
+        "notes": "512 kbps after allotment.",
+    },
+    "other": {
+        "name": "Other / Unknown",
+        "asn": [],
+        "match": [],
+        "phone_ttl": 64,
+        "throttle_kbps": 600,
+        "typical_allotment_gb": [],
+        "notes": "Unknown carrier — assuming 600 kbps throttle.",
+    },
+}
+
+
+def carrier_profile(carrier_id):
+    """Return the carrier profile dict, falling back to 'other' if unknown."""
+    return CARRIERS.get(carrier_id) or CARRIERS["other"]
+
+
+# In-memory cache for detect_carrier() — key is None, value is (timestamp, result).
+_carrier_cache = {"t": 0.0, "result": None}
+
+
+def detect_carrier(timeout=6):
+    """Return (carrier_id, detail_string, error_or_None). Never raises.
+
+    Uses ip-api.com first, falls back to ipinfo.io. Result cached 60 s.
+    """
+    now = time.time()
+    if _carrier_cache["result"] and (now - _carrier_cache["t"]) < 60:
+        return _carrier_cache["result"]
+
+    isp = org = as_str = query = ""
+    err = None
+    try:
+        req = Request("http://ip-api.com/json/?fields=status,isp,org,as,query",
+                      headers={"User-Agent": UA})
+        with urlopen(req, timeout=timeout) as r:
+            data = json.load(r)
+        if (data.get("status") or "").lower() == "success":
+            isp = data.get("isp") or ""
+            org = data.get("org") or ""
+            as_str = data.get("as") or ""
+            query = data.get("query") or ""
+        else:
+            err = "ip-api returned non-success"
+    except Exception as e:
+        err = f"ip-api failed: {e}"
+
+    if not (isp or org or as_str):
+        try:
+            req2 = Request("https://ipinfo.io/json", headers={"User-Agent": UA})
+            with urlopen(req2, timeout=timeout) as r2:
+                d2 = json.load(r2)
+            org = d2.get("org") or org
+            query = d2.get("ip") or query
+            err = None
+        except Exception as e:
+            if not err:
+                err = f"ipinfo failed: {e}"
+
+    if not (isp or org or as_str):
+        result = ("other", "", err or "no carrier data")
+        _carrier_cache.update(t=now, result=result)
+        return result
+
+    haystack = " ".join([isp, org, as_str]).lower()
+    matched_id = None
+    for cid, prof in CARRIERS.items():
+        if cid == "other":
+            continue
+        if any(m.lower() in haystack for m in prof.get("match", [])):
+            matched_id = cid
+            break
+    if not matched_id:
+        for cid, prof in CARRIERS.items():
+            if cid == "other":
+                continue
+            for asn in prof.get("asn", []):
+                if asn.lower() in haystack:
+                    matched_id = cid
+                    break
+            if matched_id:
+                break
+    if not matched_id:
+        matched_id = "other"
+
+    prof = CARRIERS[matched_id]
+    asn_hint = ""
+    m = re.search(r"AS\d+", as_str, re.I)
+    if m:
+        asn_hint = m.group(0).upper()
+    elif prof.get("asn"):
+        asn_hint = prof["asn"][0]
+    ip_hint = ""
+    if query:
+        parts = query.split(".")
+        if len(parts) == 4:
+            ip_hint = f"{parts[0]}.{parts[1]}.x.x"
+        else:
+            ip_hint = query
+    detail_bits = [prof["name"]]
+    if asn_hint:
+        detail_bits.append(f"({asn_hint})")
+    if ip_hint:
+        detail_bits.append(f"· {ip_hint}")
+    detail = " ".join(detail_bits)
+
+    result = (matched_id, detail, None)
+    _carrier_cache.update(t=now, result=result)
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Hop-count auto-detect
+# ----------------------------------------------------------------------------
+
+def _is_private_ipv4(ip):
+    """RFC1918 private: 10/8, 172.16/12, 192.168/16."""
+    try:
+        parts = [int(x) for x in ip.split(".")]
+        if len(parts) != 4:
+            return False
+        a, b = parts[0], parts[1]
+        if a == 10:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 192 and b == 168:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_cgnat_ipv4(ip):
+    """CGNAT range 100.64.0.0/10 — carrier-side, stop counting there."""
+    try:
+        parts = [int(x) for x in ip.split(".")]
+        if len(parts) != 4:
+            return False
+        return parts[0] == 100 and 64 <= parts[1] <= 127
+    except Exception:
+        return False
+
+
+def detect_hop_count():
+    """Return (hops, recommended_ttl, hop_ip_list). Never raises.
+
+    hops counts the leading RFC1918 hops between the laptop and the carrier.
+    CGNAT (100.64/10) is treated as the carrier side and stops the count.
+    Clamped to 1..4. Falls back to 1 hop on parse failure.
+    """
+    hop_ips = []
+    if not WIN:
+        return (1, CARRIERS["other"]["phone_ttl"] + 1, hop_ips)
+    try:
+        r = _run(["tracert", "-d", "-h", "4", "-w", "400", "1.1.1.1"])
+        out = (r.stdout or "") + (r.stderr or "")
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"^\s*\d+\s+.*?(\d{1,3}(?:\.\d{1,3}){3})\s*$", line)
+            if not m:
+                m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+                if not m or not re.match(r"^\s*\d+\s", line):
+                    continue
+            hop_ips.append(m.group(1))
+    except Exception as e:
+        log(f"detect_hop_count tracert failed: {e}")
+
+    hops = 0
+    for ip in hop_ips:
+        if _is_cgnat_ipv4(ip):
+            break
+        if _is_private_ipv4(ip):
+            hops += 1
+        else:
+            break
+    if hops < 1:
+        hops = 1
+    if hops > 4:
+        hops = 4
+    ttl = CARRIERS["other"]["phone_ttl"] + hops
+    return (hops, ttl, hop_ips)
+
+
+def bypass_ttl(cfg=None):
+    """Return the TTL to apply for the current carrier + hop-count config.
+
+    Precedence: cfg["custom_ttl"] (32..255, nonzero) → carrier phone_ttl + hop_count.
+    Safe to call with cfg=None (uses defaults).
+    """
+    if cfg is None:
+        cfg = {}
+    custom = cfg.get("custom_ttl") or 0
+    try:
+        custom = int(custom)
+    except Exception:
+        custom = 0
+    if 32 <= custom <= 255:
+        return custom
+    cid = cfg.get("carrier") or "other"
+    if cid == "auto":
+        # never block the caller on a network round-trip — only use the
+        # already-cached detect_carrier result, otherwise fall back to "other"
+        cached = _carrier_cache.get("result")
+        cid = cached[0] if cached else "other"
+    prof = carrier_profile(cid)
+    hops = cfg.get("hop_count") or 1
+    try:
+        hops = int(hops)
+    except Exception:
+        hops = 1
+    hops = max(1, min(4, hops))
+    return int(prof["phone_ttl"]) + hops
+
+
+ABS_CLEAR_MBPS = 3.0   # nothing under this is "full speed" on modern LTE/5G
+
+
+def throttle_verdict(mbps, carrier_id):
+    """Classify a speed-test result vs the carrier's throttle floor.
+
+    Returns (state, message) where state ∈ {"capped", "suspect", "clear"}.
+    """
+    prof = carrier_profile(carrier_id)
+    throttle_kbps = int(prof.get("throttle_kbps") or 600)
+    throttle_mbps = throttle_kbps / 1000.0
+    name = prof.get("name") or "your carrier"
+    if mbps is None or mbps < 0:
+        return ("suspect", "Speed test unavailable")
+    low = throttle_mbps * 0.6
+    high = throttle_mbps * 1.4
+    if low <= mbps <= high:
+        return ("capped", f"You're sitting on {name}'s {throttle_kbps} kbps hotspot cap")
+    if mbps < throttle_mbps * 1.6:
+        return ("suspect", f"Below 1.6× the {name} throttle floor — bypass may be leaking")
+    if mbps < ABS_CLEAR_MBPS:
+        # Carriers with a very low floor (AT&T 128 kbps) would otherwise call
+        # 0.6 Mbps "full speed". Nothing under a few Mbps is healthy on LTE/5G.
+        return ("suspect",
+                f"{mbps:.1f} Mbps clears {name}'s throttle floor but is still slow "
+                f"for LTE/5G — check signal, or you may be deprioritized (TTL won't help that)")
+    return ("clear", "Full-speed — bypass is holding")
+
+
+# ----------------------------------------------------------------------------
+# Hardening: NCSI beacons + metered Wi-Fi (Windows registry, fail-soft)
+# ----------------------------------------------------------------------------
+
+def _reg_read_dword(root_name, subkey, value_name):
+    if not WIN:
+        return None
+    try:
+        import winreg
+        root = getattr(winreg, root_name)
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ) as k:
+            v, _ = winreg.QueryValueEx(k, value_name)
+            return int(v)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log(f"_reg_read_dword {root_name}\\{subkey}\\{value_name} failed: {e}")
+        return None
+
+
+def _reg_write_dword(root_name, subkey, value_name, value):
+    if not WIN:
+        return (False, "not windows")
+    try:
+        import winreg
+        root = getattr(winreg, root_name)
+        with winreg.OpenKey(root, subkey, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, value_name, 0, winreg.REG_DWORD, int(value))
+        return (True, "")
+    except PermissionError as e:
+        return (False, f"permission denied: {e}")
+    except OSError as e:
+        return (False, f"os error: {e}")
+    except Exception as e:
+        return (False, f"error: {e}")
+
+
+_NCSI_KEY = (r"SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet",
+             "EnableActiveProbing")
+_METERED_KEY = (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\DefaultMediaCost",
+                "WiFi")
+
+
+def apply_disable_ncsi(cfg):
+    """Set EnableActiveProbing=0 to stop msftconnecttest.com beacons.
+
+    Saves the previous value to cfg['ncsi_prev'] so restore is exact.
+    Returns (ok, detail). Never raises.
+    """
+    prev = _reg_read_dword("HKEY_LOCAL_MACHINE", _NCSI_KEY[0], _NCSI_KEY[1])
+    if prev is not None:
+        cfg["ncsi_prev"] = prev
+    ok, detail = _reg_write_dword("HKEY_LOCAL_MACHINE", _NCSI_KEY[0], _NCSI_KEY[1], 0)
+    log(f"apply_disable_ncsi ok={ok} prev={prev} detail={detail!r}")
+    return (ok, detail)
+
+
+def restore_ncsi(cfg):
+    """Restore EnableActiveProbing to its saved value (or 1 if none saved)."""
+    prev = cfg.get("ncsi_prev")
+    if prev is None:
+        prev = 1
+    ok, detail = _reg_write_dword("HKEY_LOCAL_MACHINE", _NCSI_KEY[0], _NCSI_KEY[1], int(prev))
+    log(f"restore_ncsi ok={ok} to={prev} detail={detail!r}")
+    return (ok, detail)
+
+
+def apply_metered_wifi(cfg):
+    """Mark Wi-Fi as metered (DefaultMediaCost\\WiFi = 2).
+
+    This key is owned by TrustedInstaller and often blocks writes; return a
+    clean (False, message) instead of raising.
+    """
+    prev = _reg_read_dword("HKEY_LOCAL_MACHINE", _METERED_KEY[0], _METERED_KEY[1])
+    if prev is not None:
+        cfg["metered_prev"] = prev
+    ok, detail = _reg_write_dword("HKEY_LOCAL_MACHINE", _METERED_KEY[0], _METERED_KEY[1], 2)
+    if not ok:
+        detail = "Windows blocks writes to this key — skip or take ownership manually"
+    log(f"apply_metered_wifi ok={ok} prev={prev} detail={detail!r}")
+    return (ok, detail)
+
+
+def restore_metered_wifi(cfg):
+    """Restore Wi-Fi media cost to the saved value (or 1 = unmetered)."""
+    prev = cfg.get("metered_prev")
+    if prev is None:
+        prev = 1
+    ok, detail = _reg_write_dword("HKEY_LOCAL_MACHINE", _METERED_KEY[0], _METERED_KEY[1], int(prev))
+    if not ok:
+        detail = "Windows blocks writes to this key — skip or take ownership manually"
+    log(f"restore_metered_wifi ok={ok} to={prev} detail={detail!r}")
+    return (ok, detail)
 
 # Common phone-hotspot SSIDs used for auto-detect. User can extend in Settings.
 DEFAULT_HOTSPOT_SSIDS = [
@@ -104,6 +552,14 @@ def _load_config():
         "hotspot_auto": False,
         "hotspot_ssids": list(DEFAULT_HOTSPOT_SSIDS),
         "check_updates": True,
+        # multi-carrier
+        "carrier": "auto",
+        "hop_count": 1,
+        "custom_ttl": 0,
+        "auto_detect_carrier": True,
+        # hardening
+        "ncsi_disabled": False,
+        "metered_wifi": False,
     }
     try:
         with open(_config_path(), "r", encoding="utf-8") as f:
@@ -749,9 +1205,9 @@ def build_ui():
                 import ctypes
                 ctypes.windll.user32.MessageBoxW(
                     None,
-                    "T-Mobile Bypass needs Administrator rights to change the hop limit.\n\n"
+                    "Carrier Bypass needs Administrator rights to change the hop limit.\n\n"
                     "Re-open the app and click Yes on the UAC prompt.",
-                    "T-Mobile Bypass", 0x10)
+                    "Carrier Bypass", 0x10)
             except Exception:
                 pass
         sys.exit(0)
@@ -869,9 +1325,10 @@ def build_ui():
             p.setPen(QPen(QColor(ACCENT), 2))
             p.setBrush(Qt.NoBrush)
             p.drawPolyline(poly)
-            # dots colored by bypass state
+            # dots colored by bypass state (any non-default, non-zero TTL = bypass was on)
             for i, (v, ttl) in enumerate(self._points):
-                col = QColor(ACCENT) if ttl == BYPASS_TTL else QColor(MUTED)
+                bypass_on = bool(ttl) and ttl != DEFAULT_TTL
+                col = QColor(ACCENT) if bypass_on else QColor(MUTED)
                 p.setBrush(col)
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(pt(i, v), 4, 4)
@@ -949,7 +1406,7 @@ def build_ui():
     class MainWindow(QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("T-Mobile Bypass")
+            self.setWindowTitle("Carrier Bypass")
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
             self.setAttribute(Qt.WA_TranslucentBackground, True)
             self.setFixedSize(600, 760)
@@ -958,6 +1415,7 @@ def build_ui():
             self._dl_worker = None
             self._queue_worker = None
             self._update_worker = None
+            self._detect_worker = None
             self._bypass_test = None
             self._quitting = False
             self._build()
@@ -967,7 +1425,7 @@ def build_ui():
         # ---- tray ----
         def _build_tray(self):
             self.tray = QSystemTrayIcon(_icon(), self)
-            self.tray.setToolTip("T-Mobile Bypass")
+            self.tray.setToolTip("Carrier Bypass")
             menu = QMenu()
             a_show = QAction("Open", self)
             a_show.triggered.connect(self._show_from_tray)
@@ -1014,7 +1472,7 @@ def build_ui():
             root.setSpacing(10)
 
             bar = QHBoxLayout()
-            title = QLabel("T-Mobile Bypass")
+            title = QLabel("Carrier Bypass")
             title.setStyleSheet(f"color:{TEXT}; font-size:16px; font-weight:700;")
             sub = QLabel(f"v{VERSION}  ·  hotspot cap killer  ·  fast downloader")
             sub.setStyleSheet(f"color:{MUTED}; font-size:11px;")
@@ -1052,6 +1510,9 @@ def build_ui():
             # auto-check update
             if cfg.get("check_updates", True):
                 QTimer.singleShot(4000, self._auto_check_update)
+            # auto-detect carrier + hop count on launch (never blocks — worker thread)
+            if cfg.get("auto_detect_carrier", True):
+                QTimer.singleShot(1500, self._on_detect_carrier)
             # watchdog timer
             self._watchdog = QTimer(self)
             self._watchdog.timeout.connect(self._watchdog_tick)
@@ -1071,6 +1532,12 @@ def build_ui():
             self.hl_label = QLabel("Hop limit: —")
             self.hl_label.setStyleSheet(f"color:{TEXT}; font-size:20px; font-weight:700;")
             cv.addWidget(self.hl_label)
+            self.carrier_label = QLabel("Carrier: —")
+            self.carrier_label.setStyleSheet(f"color:{MUTED}; font-size:12px;")
+            cv.addWidget(self.carrier_label)
+            self.path_label = QLabel("Path: —")
+            self.path_label.setStyleSheet(f"color:{MUTED}; font-size:12px;")
+            cv.addWidget(self.path_label)
             self.conn_label = QLabel("Connection: —")
             self.conn_label.setStyleSheet(f"color:{MUTED}; font-size:12px;")
             cv.addWidget(self.conn_label)
@@ -1087,6 +1554,33 @@ def build_ui():
             self._set_toggle_style(active=False)
             self.toggle.clicked.connect(self._on_toggle)
             v.addWidget(self.toggle)
+
+            # Carrier picker + Detect (compact single row)
+            crow = QHBoxLayout()
+            self.carrier_combo = QComboBox()
+            self.carrier_combo.addItem("Auto-detect", "auto")
+            for cid, prof in CARRIERS.items():
+                self.carrier_combo.addItem(prof["name"], cid)
+            sel = cfg.get("carrier", "auto")
+            idx = self.carrier_combo.findData(sel)
+            if idx >= 0:
+                self.carrier_combo.setCurrentIndex(idx)
+            self.carrier_combo.setStyleSheet(
+                f"QComboBox {{ background:rgba(0,0,0,0.3); color:{TEXT}; border:1px solid rgba(255,255,255,0.1);"
+                f" border-radius:9px; padding:6px 10px; font-size:12px; }}\n"
+                f"QComboBox:focus {{ border:1px solid {ACCENT}; }}\n"
+                f"QComboBox QAbstractItemView {{ background:#141821; color:{TEXT}; selection-background-color:{ACCENT}; }}")
+            self.carrier_combo.currentIndexChanged.connect(self._on_carrier_changed)
+            crow.addWidget(self.carrier_combo, 1)
+            self.detect_btn = QPushButton("Detect")
+            self.detect_btn.setFixedHeight(32)
+            self.detect_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.08); color:{TEXT}; border:1px solid rgba(255,255,255,0.15);"
+                f" border-radius:9px; font-size:12px; font-weight:600; padding:0 14px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
+            self.detect_btn.clicked.connect(self._on_detect_carrier)
+            crow.addWidget(self.detect_btn)
+            v.addLayout(crow)
 
             self.bypass_test_btn = QPushButton("⚡ BYPASS + TEST  (before → after)")
             self.bypass_test_btn.setFixedHeight(40)
@@ -1146,6 +1640,10 @@ def build_ui():
             self.speed_state = QLabel("green = bypass on · gray = off")
             self.speed_state.setStyleSheet(f"color:{MUTED}; font-size:11px;")
             cv.addWidget(self.speed_state)
+            self.verdict_label = QLabel("")
+            self.verdict_label.setStyleSheet(f"color:{MUTED}; font-size:12px; font-weight:600;")
+            self.verdict_label.setWordWrap(True)
+            cv.addWidget(self.verdict_label)
             v.addWidget(card)
 
             card2, cv2 = _card(page, "HISTORY")
@@ -1252,6 +1750,69 @@ def build_ui():
             cv.addWidget(self.auto_start)
             v.addWidget(card)
 
+            # Hop count + custom TTL override
+            from PySide6.QtWidgets import QSpinBox  # local import — avoids top-of-file bloat
+            card_hops, cv_hops = _card(page, "TTL / HOP COUNT")
+            spinstyle = (
+                f"QSpinBox {{ background:rgba(0,0,0,0.3); color:{TEXT};"
+                f" border:1px solid rgba(255,255,255,0.1); border-radius:9px;"
+                f" padding:4px 8px; font-size:12px; min-width:70px; }}\n"
+                f"QSpinBox:focus {{ border:1px solid {ACCENT}; }}")
+            hop_row = QHBoxLayout()
+            hop_lbl = QLabel("Hop count (laptop → phone)")
+            hop_lbl.setStyleSheet(f"color:{TEXT}; font-size:12px;")
+            self.hop_spin = QSpinBox()
+            self.hop_spin.setRange(1, 4)
+            self.hop_spin.setValue(int(cfg.get("hop_count") or 1))
+            self.hop_spin.setStyleSheet(spinstyle)
+            self.hop_spin.valueChanged.connect(self._on_hop_count_changed)
+            hop_row.addWidget(hop_lbl); hop_row.addStretch(); hop_row.addWidget(self.hop_spin)
+            cv_hops.addLayout(hop_row)
+
+            ttl_row = QHBoxLayout()
+            ttl_lbl = QLabel("Custom TTL override (0 = off · 32–255)")
+            ttl_lbl.setStyleSheet(f"color:{TEXT}; font-size:12px;")
+            self.ttl_spin = QSpinBox()
+            self.ttl_spin.setRange(0, 255)
+            self.ttl_spin.setValue(int(cfg.get("custom_ttl") or 0))
+            self.ttl_spin.setStyleSheet(spinstyle)
+            self.ttl_spin.valueChanged.connect(self._on_custom_ttl_changed)
+            ttl_row.addWidget(ttl_lbl); ttl_row.addStretch(); ttl_row.addWidget(self.ttl_spin)
+            cv_hops.addLayout(ttl_row)
+            v.addWidget(card_hops)
+
+            # Hardening toggles
+            card_hard, cv_hard = _card(page, "HARDENING (extra tethering signals)")
+            self.chk_ncsi = QCheckBox("Disable Windows connectivity beacons (NCSI)")
+            self.chk_ncsi.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_ncsi.setChecked(bool(cfg.get("ncsi_disabled")))
+            self.chk_ncsi.toggled.connect(self._on_ncsi_toggle)
+            cv_hard.addWidget(self.chk_ncsi)
+            ncsi_note = QLabel(
+                "Stops periodic msftconnecttest.com probes that fingerprint the device as a Windows PC. "
+                "Side effect: the Wi-Fi icon may stop showing “internet access”.")
+            ncsi_note.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            ncsi_note.setWordWrap(True)
+            cv_hard.addWidget(ncsi_note)
+
+            self.chk_metered = QCheckBox("Treat this Wi-Fi as metered")
+            self.chk_metered.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_metered.setChecked(bool(cfg.get("metered_wifi")))
+            self.chk_metered.toggled.connect(self._on_metered_toggle)
+            cv_hard.addWidget(self.chk_metered)
+            metered_note = QLabel(
+                "Windows Update / Store / OneDrive stop pulling large transfers that give away a desktop. "
+                "This key is owned by TrustedInstaller — if the write is blocked you’ll see a clean skip message.")
+            metered_note.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            metered_note.setWordWrap(True)
+            cv_hard.addWidget(metered_note)
+
+            self.hardening_status = QLabel("")
+            self.hardening_status.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            self.hardening_status.setWordWrap(True)
+            cv_hard.addWidget(self.hardening_status)
+            v.addWidget(card_hard)
+
             card2, cv2 = _card(page, "HOTSPOT SSIDs (auto-detect)")
             self.ssid_edit = QLineEdit()
             self.ssid_edit.setText(", ".join(cfg.get("hotspot_ssids", [])))
@@ -1290,8 +1851,8 @@ def build_ui():
 
             card4, cv4 = _card(page, "ABOUT & LOGS")
             about = QLabel(
-                "Defeats T-Mobile's hotspot cap via TTL/hop-limit fix.\n"
-                "Only affects your own connection. Violates T-Mobile ToS.\n"
+                "Defeats your carrier's hotspot cap via TTL/hop-limit fix.\n"
+                "Only affects your own connection. May violate your carrier's terms of service.\n"
                 f"Repo: github.com/{GITHUB_REPO}")
             about.setStyleSheet(f"color:{MUTED}; font-size:11px;")
             about.setWordWrap(True)
@@ -1340,7 +1901,8 @@ def build_ui():
 
         def closeEvent(self, e):
             if self._quitting:
-                for w in (self._speed_worker, self._dl_worker, self._queue_worker, self._update_worker):
+                for w in (self._speed_worker, self._dl_worker, self._queue_worker,
+                          self._update_worker, self._detect_worker):
                     if w is not None and w.isRunning():
                         w.wait(3000)
                 super().closeEvent(e)
@@ -1348,19 +1910,29 @@ def build_ui():
                 e.ignore()
                 self.hide()
                 self.tray.showMessage(
-                    "T-Mobile Bypass",
+                    "Carrier Bypass",
                     "Still running in the tray. Right-click the icon to quit.",
                     QSystemTrayIcon.Information, 2500)
 
         # ---- refresh / watchdog / hotspot ----
+        def _current_carrier_id(self):
+            sel = cfg.get("carrier", "auto")
+            if sel == "auto":
+                cached = _carrier_cache.get("result")
+                if cached:
+                    return cached[0]
+                return "other"
+            return sel
+
         def _refresh(self):
             hl = get_hoplimit()
-            log(f"refresh: hoplimit={hl} admin={is_admin()}")
+            target = bypass_ttl(cfg)
+            log(f"refresh: hoplimit={hl} target={target} admin={is_admin()}")
             if hl is None:
                 self.hl_label.setText("Hop limit: unknown")
                 self.state_label.setText("⚠ couldn't read netsh (not admin?)")
                 self.state_label.setStyleSheet(f"color:{WARN}; font-size:12px;")
-            elif hl == BYPASS_TTL:
+            elif hl == target:
                 self.hl_label.setText(f"Hop limit: {hl}")
                 self.hl_label.setStyleSheet(f"color:{ACCENT}; font-size:20px; font-weight:700;")
                 self.state_label.setText("✓ Bypass active — tethered traffic looks phone-native")
@@ -1372,6 +1944,24 @@ def build_ui():
                 self.state_label.setText("— bypass off (carrier sees tethered TTL)")
                 self.state_label.setStyleSheet(f"color:{MUTED}; font-size:12px;")
                 self._set_toggle_style(active=False)
+            # carrier + path
+            cid = self._current_carrier_id()
+            prof = carrier_profile(cid)
+            sel_mode = "auto" if cfg.get("carrier", "auto") == "auto" else "manual"
+            cached = _carrier_cache.get("result")
+            detail = cached[1] if (cached and sel_mode == "auto") else ""
+            ctext = f"Carrier: {prof['name']} ({sel_mode})"
+            if detail and sel_mode == "auto":
+                ctext += f"  ·  {detail}"
+            self.carrier_label.setText(ctext)
+            hops = int(cfg.get("hop_count") or 1)
+            custom = int(cfg.get("custom_ttl") or 0)
+            if 32 <= custom <= 255:
+                self.path_label.setText(f"Path: custom TTL override → {custom}")
+            else:
+                hop_word = "hop" if hops == 1 else "hops"
+                self.path_label.setText(
+                    f"Path: laptop → phone ({hops} {hop_word}) → target TTL {target}")
             host, ip = detect_connection()
             self.conn_label.setText(f"Connection: {host} ({ip})")
             ssid = get_active_ssid()
@@ -1380,9 +1970,10 @@ def build_ui():
         def _watchdog_tick(self):
             if cfg.get("auto_bypass"):
                 hl = get_hoplimit()
-                if hl is not None and hl != BYPASS_TTL:
-                    log(f"watchdog: hoplimit drifted to {hl}, re-applying {BYPASS_TTL}")
-                    set_hoplimit(BYPASS_TTL)
+                target = bypass_ttl(cfg)
+                if hl is not None and hl != target:
+                    log(f"watchdog: hoplimit drifted to {hl}, re-applying {target}")
+                    set_hoplimit(target)
                     self._refresh()
 
         def _hotspot_tick(self):
@@ -1390,21 +1981,23 @@ def build_ui():
                 ssid = get_active_ssid()
                 if is_hotspot_ssid(ssid, cfg.get("hotspot_ssids", [])):
                     hl = get_hoplimit()
-                    if hl != BYPASS_TTL:
-                        log(f"hotspot detected ({ssid}), enabling bypass")
-                        set_hoplimit(BYPASS_TTL)
+                    target = bypass_ttl(cfg)
+                    if hl != target:
+                        log(f"hotspot detected ({ssid}), enabling bypass ttl={target}")
+                        set_hoplimit(target)
                         self._refresh()
                         self.tray.showMessage(
-                            "T-Mobile Bypass", f"Hotspot detected ({ssid}) — bypass enabled.",
+                            "Carrier Bypass", f"Hotspot detected ({ssid}) — bypass enabled.",
                             QSystemTrayIcon.Information, 3000)
 
         # ---- bypass actions ----
         def _on_toggle(self):
             hl = get_hoplimit()
-            if hl == BYPASS_TTL:
+            target = bypass_ttl(cfg)
+            if hl == target:
                 return self._on_restore()
-            ok, detail = set_hoplimit(BYPASS_TTL)
-            log(f"enable bypass: ok={ok} detail={detail!r}")
+            ok, detail = set_hoplimit(target)
+            log(f"enable bypass: target={target} ok={ok} detail={detail!r}")
             if ok:
                 self._set_toggle_style(active=True)
             else:
@@ -1423,9 +2016,49 @@ def build_ui():
             cfg["auto_bypass"] = bool(checked)
             _save_config(cfg)
             if checked:
-                ok, _ = set_hoplimit(BYPASS_TTL)
-                log(f"auto_bypass enabled; apply now ok={ok}")
+                target = bypass_ttl(cfg)
+                ok, _ = set_hoplimit(target)
+                log(f"auto_bypass enabled; apply {target} ok={ok}")
                 self._refresh()
+
+        # ---- carrier / hop detection ----
+        def _on_carrier_changed(self, _idx):
+            cid = self.carrier_combo.currentData() or "auto"
+            cfg["carrier"] = cid
+            _save_config(cfg)
+            self._refresh()
+
+        def _on_detect_carrier(self):
+            self.detect_btn.setEnabled(False)
+            self.detect_btn.setText("Detecting…")
+
+            def _do():
+                cinfo = detect_carrier()
+                hinfo = detect_hop_count()
+                return (cinfo, hinfo)
+
+            def _done(res):
+                self.detect_btn.setEnabled(True)
+                self.detect_btn.setText("Detect")
+                if res[0] != "ok":
+                    self.state_label.setText(f"Detect failed: {str(res[1])[:80]}")
+                    self.state_label.setStyleSheet(f"color:{WARN}; font-size:12px;")
+                    return
+                (cid, detail, cerr), (hops, ttl, hop_ips) = res[1]
+                cfg["hop_count"] = int(hops)
+                if cfg.get("auto_detect_carrier", True) and cfg.get("carrier", "auto") == "auto":
+                    pass  # auto mode: cid comes from live cache on _refresh
+                _save_config(cfg)
+                if hasattr(self, "hop_spin"):
+                    self.hop_spin.blockSignals(True)
+                    self.hop_spin.setValue(int(hops))
+                    self.hop_spin.blockSignals(False)
+                log(f"detect: carrier={cid} detail={detail!r} err={cerr} hops={hops} ttl={ttl} ips={hop_ips}")
+                self._refresh()
+
+            self._detect_worker = Worker(_do)
+            self._detect_worker.done.connect(_done)
+            self._detect_worker.start()
 
         def _on_hotspot_auto(self, checked):
             cfg["hotspot_auto"] = bool(checked)
@@ -1446,6 +2079,77 @@ def build_ui():
         def _on_check_updates_toggle(self, checked):
             cfg["check_updates"] = bool(checked)
             _save_config(cfg)
+
+        def _on_hop_count_changed(self, value):
+            cfg["hop_count"] = int(value)
+            _save_config(cfg)
+            # if bypass is currently on, re-apply the new target so the fix stays valid
+            hl = get_hoplimit()
+            if hl is not None and hl != DEFAULT_TTL:
+                target = bypass_ttl(cfg)
+                if hl != target:
+                    ok, _ = set_hoplimit(target)
+                    log(f"hop_count changed to {value}; re-apply {target} ok={ok}")
+            self._refresh()
+
+        def _on_custom_ttl_changed(self, value):
+            v = int(value)
+            if v != 0 and not (32 <= v <= 255):
+                # invalid range → treat as off
+                v = 0
+            cfg["custom_ttl"] = v
+            _save_config(cfg)
+            hl = get_hoplimit()
+            if hl is not None and hl != DEFAULT_TTL:
+                target = bypass_ttl(cfg)
+                if hl != target:
+                    ok, _ = set_hoplimit(target)
+                    log(f"custom_ttl changed to {v}; re-apply {target} ok={ok}")
+            self._refresh()
+
+        def _on_ncsi_toggle(self, checked):
+            try:
+                if checked:
+                    ok, detail = apply_disable_ncsi(cfg)
+                else:
+                    ok, detail = restore_ncsi(cfg)
+            except Exception as e:  # belt-and-braces; helpers already fail-soft
+                ok, detail = (False, str(e))
+                log(f"_on_ncsi_toggle unexpected: {e}")
+            cfg["ncsi_disabled"] = bool(checked and ok)
+            _save_config(cfg)
+            if not ok:
+                self.chk_ncsi.blockSignals(True)
+                self.chk_ncsi.setChecked(not checked)
+                self.chk_ncsi.blockSignals(False)
+                self.hardening_status.setText(f"NCSI toggle failed: {detail[:120]}")
+                self.hardening_status.setStyleSheet(f"color:{WARN}; font-size:11px;")
+            else:
+                self.hardening_status.setText(
+                    "NCSI beacons disabled." if checked else "NCSI beacons restored.")
+                self.hardening_status.setStyleSheet(f"color:{ACCENT}; font-size:11px;")
+
+        def _on_metered_toggle(self, checked):
+            try:
+                if checked:
+                    ok, detail = apply_metered_wifi(cfg)
+                else:
+                    ok, detail = restore_metered_wifi(cfg)
+            except Exception as e:
+                ok, detail = (False, str(e))
+                log(f"_on_metered_toggle unexpected: {e}")
+            cfg["metered_wifi"] = bool(checked and ok)
+            _save_config(cfg)
+            if not ok:
+                self.chk_metered.blockSignals(True)
+                self.chk_metered.setChecked(not checked)
+                self.chk_metered.blockSignals(False)
+                self.hardening_status.setText(f"Metered Wi-Fi toggle failed: {detail[:160]}")
+                self.hardening_status.setStyleSheet(f"color:{WARN}; font-size:11px;")
+            else:
+                self.hardening_status.setText(
+                    "Wi-Fi marked as metered." if checked else "Wi-Fi metered flag restored.")
+                self.hardening_status.setStyleSheet(f"color:{ACCENT}; font-size:11px;")
 
         def _open_log(self):
             path = log_path()
@@ -1473,18 +2177,32 @@ def build_ui():
                     log(f"speed test result: {mbps} err={err}")
                     if mbps < 0:
                         self.speed_val.setText(f"✗ {err[:40]}")
+                        self._set_verdict(None)
                     else:
                         self.speed_val.setText(f"{mbps:.1f} Mbps")
                         ttl = get_hoplimit() or 0
                         hist = _append_history({"t": time.time(), "mbps": round(mbps, 1), "ttl": ttl})
                         self.graph.set_points([(h["mbps"], h["ttl"]) for h in hist])
+                        self._set_verdict(mbps)
                 else:
                     log(f"speed test error: {res[1]}")
                     self.speed_val.setText(f"✗ {res[1][:40]}")
+                    self._set_verdict(None)
 
             self._speed_worker = Worker(speed_test)
             self._speed_worker.done.connect(done)
             self._speed_worker.start()
+
+        def _set_verdict(self, mbps):
+            if mbps is None:
+                self.verdict_label.setText("")
+                self.verdict_label.setStyleSheet(f"color:{MUTED}; font-size:12px; font-weight:600;")
+                return
+            cid = self._current_carrier_id()
+            state, msg = throttle_verdict(mbps, cid)
+            color = {"capped": BAD, "suspect": WARN, "clear": ACCENT}.get(state, MUTED)
+            self.verdict_label.setText(msg)
+            self.verdict_label.setStyleSheet(f"color:{color}; font-size:12px; font-weight:600;")
 
         def _clear_history(self):
             try:
@@ -1505,8 +2223,9 @@ def build_ui():
                 mbps, _ = res[1] if res[0] == "ok" else (-1, res[1])
                 self._bypass_test["before"] = mbps
                 self.speed_val.setText("applying bypass…")
-                ok, detail = set_hoplimit(BYPASS_TTL)
-                log(f"bypass+test: apply ok={ok} detail={detail!r}")
+                target = bypass_ttl(cfg)
+                ok, detail = set_hoplimit(target)
+                log(f"bypass+test: apply ttl={target} ok={ok} detail={detail!r}")
                 flush_dns()
 
                 def after_test(res2):
@@ -1521,9 +2240,11 @@ def build_ui():
                         ttl = get_hoplimit() or 0
                         hist = _append_history({"t": time.time(), "mbps": round(after_mbps, 1), "ttl": ttl})
                         self.graph.set_points([(h["mbps"], h["ttl"]) for h in hist])
+                        self._set_verdict(after_mbps)
                         QMessageBox.information(self, "Bypass + Test", msg)
                     else:
                         self.speed_val.setText(f"before={before} after={after_mbps}")
+                        self._set_verdict(None)
 
                 self._speed_worker = Worker(speed_test)
                 self._speed_worker.done.connect(after_test)

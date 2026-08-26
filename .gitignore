@@ -6,3 +6,7 @@ __pycache__/
 *.exe
 *.log
 CRASH.log
+
+# test/build scratch output
+smoke_out.txt
+build_out.txt
