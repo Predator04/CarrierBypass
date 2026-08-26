@@ -116,9 +116,12 @@ def _load_config():
 
 
 def _save_config(cfg):
+    p = _config_path()
+    tmp = p + ".tmp"
     try:
-        with open(_config_path(), "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        os.replace(tmp, p)
         return True
     except Exception:
         return False
@@ -138,9 +141,12 @@ def _append_history(entry):
     hist.append(entry)
     # keep last 200 points
     hist = hist[-200:]
+    p = _history_path()
+    tmp = p + ".tmp"
     try:
-        with open(_history_path(), "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(hist, f)
+        os.replace(tmp, p)
     except Exception:
         pass
     return hist
@@ -150,19 +156,34 @@ def _append_history(entry):
 # Logging
 # ----------------------------------------------------------------------------
 
-def log(msg):
+LOG_MAX_BYTES = 512 * 1024  # rotate the log once it grows past ~512 KB
+
+
+def log(msg, level="INFO"):
     try:
         path = os.path.join(_data_dir(), "tmobile_bypass.log")
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+                rotated = path + ".1"
+                if os.path.exists(rotated):
+                    os.remove(rotated)
+                os.replace(path, rotated)
+        except Exception:
+            pass
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  [{level}] {msg}\n")
     except Exception:
         pass
+
+
+def log_path():
+    return os.path.join(_data_dir(), "tmobile_bypass.log")
 
 
 def _install_excepthook():
     def hook(exc_type, exc, tb):
         msg = "".join(traceback.format_exception(exc_type, exc, tb))
-        log("UNHANDLED EXCEPTION:\n" + msg)
+        log("UNHANDLED EXCEPTION:\n" + msg, "ERROR")
         try:
             with open(os.path.join(_data_dir(), "CRASH.log"), "w", encoding="utf-8") as f:
                 f.write(msg)
@@ -188,9 +209,7 @@ def set_hoplimit(value):
     r1 = _run(["netsh", "int", "ipv4", "set", "glob", f"defaultcurhoplimit={value}"])
     r2 = _run(["netsh", "int", "ipv6", "set", "glob", f"defaultcurhoplimit={value}"])
     detail = (r1.stdout + r1.stderr + r2.stdout + r2.stderr).strip()
-    bad = ("elevation", "denied", "failed", "requires", "access is denied")
-    lowered = detail.lower()
-    if r1.returncode != 0 or r2.returncode != 0 or any(w in lowered for w in bad):
+    if r1.returncode != 0 or r2.returncode != 0:
         return False, detail
     if get_hoplimit() != value:
         return False, "hop limit did not change after set"
@@ -214,7 +233,7 @@ def is_admin():
 
 def relaunch_as_admin():
     if not WIN:
-        return
+        return False
     import ctypes
     try:
         if getattr(sys, "frozen", False):
@@ -225,8 +244,11 @@ def relaunch_as_admin():
                                                   params or "", None, 1)
         if ret <= 32:
             log(f"relaunch_as_admin failed: ShellExecuteW returned {ret}")
+            return False
+        return True
     except Exception as e:
         log(f"relaunch_as_admin failed: {e}")
+        return False
 
 
 def get_active_ssid():
@@ -248,16 +270,14 @@ def get_gateway_ip():
 
 
 def is_hotspot_ssid(ssid, extra_ssids):
-    """Return True if ssid looks like a phone hotspot."""
+    """Return True if ssid looks like a phone hotspot (whole-token match)."""
     if not ssid:
         return False
-    low = ssid.lower().strip()
-    pool = [s.lower() for s in (extra_ssids or [])]
-    pool += DEFAULT_HOTSPOT_SSIDS
-    for p in pool:
-        if p and p in low:
-            return True
-    return False
+    tokens = re.findall(r"[a-z0-9]+", ssid.lower())
+    pool = set((s or "").lower().strip() for s in (extra_ssids or []))
+    pool |= set(DEFAULT_HOTSPOT_SSIDS)
+    pool.discard("")
+    return any(t in pool for t in tokens)
 
 
 # ----------------------------------------------------------------------------
@@ -388,10 +408,12 @@ def install_update(new_exe):
         bat = os.path.join(tempfile.gettempdir(), "tmb_update.bat")
         lines = [
             "@echo off",
-            "timeout /t 2 /nobreak >nul",
-            f'move /y "{new_exe}" "{cur}" >nul',
+            "setlocal",
+            ":loop",
+            f'move /y "{new_exe}" "{cur}" >nul 2>&1',
+            "if errorlevel 1 (timeout /t 1 /nobreak >nul & goto loop)",
             f'start "" "{cur}"',
-            "del \"%~f0\"",
+            'del "%~f0"',
         ]
         with open(bat, "w", encoding="ascii") as f:
             f.write("\r\n".join(lines))
@@ -457,6 +479,12 @@ class ParallelDownloader:
         if self.resume and os.path.exists(self.meta) and os.path.exists(self.part):
             try:
                 data = open(self.meta, "rb").read()
+                if data.startswith(b"SIZE="):
+                    nl = data.index(b"\n")
+                    saved_size = int(data[5:nl])
+                    if saved_size != self.size:
+                        return bm  # remote size changed → discard stale bitmap
+                    data = data[nl + 1:]
                 k = min(n, len(data))
                 bm[:k] = data[:k]
             except Exception:
@@ -468,6 +496,7 @@ class ParallelDownloader:
             return
         try:
             with open(self.meta, "wb") as f:
+                f.write(f"SIZE={self.size}\n".encode())
                 f.write(bytes(self._bitmap))
         except Exception:
             pass
@@ -484,6 +513,24 @@ class ParallelDownloader:
         with self._lock:
             for b in range(b0, b1 + 1):
                 if b < len(self._bitmap):
+                    self._bitmap[b] = 1
+
+    def _mark_completed_upto(self, start, end_written_inclusive):
+        """Mark only blocks whose final byte has actually been written.
+
+        Avoids marking a block complete when the write pointer has only touched
+        its first byte — otherwise a resume after a mid-block cancel would skip
+        the unwritten tail and silently corrupt the file.
+        """
+        if self._bitmap is None:
+            return
+        b0 = start // self.BLOCK
+        last_full = (end_written_inclusive + 1) // self.BLOCK - 1
+        if last_full < b0:
+            return
+        with self._lock:
+            for b in range(b0, last_full + 1):
+                if 0 <= b < len(self._bitmap):
                     self._bitmap[b] = 1
 
     def _fetch_range(self, start, end):
@@ -513,7 +560,9 @@ class ParallelDownloader:
                             self.speed = (self.done - self._last_done) / dt
                             self._last_done = self.done
                             self._last_time = now
-                    self._mark(start, pos - 1)
+                    self._mark_completed_upto(start, pos - 1)
+            if pos - 1 != end:
+                raise DownloadError(f"short read: got {pos - start} of {end - start + 1} bytes")
             self._mark(start, end)
 
     def _parallel(self, progress_cb, cancel_check):
@@ -604,7 +653,12 @@ class ParallelDownloader:
 
     def _finalize(self):
         if os.path.exists(self.part):
-            shutil.move(self.part, self.dest)
+            if os.path.exists(self.dest):
+                try:
+                    os.remove(self.dest)
+                except Exception:
+                    pass
+            os.replace(self.part, self.dest)
         if os.path.exists(self.meta):
             try:
                 os.remove(self.meta)
@@ -616,6 +670,8 @@ class ParallelDownloader:
         self.supports_ranges = self._probe_ranges() if self.size > 0 else False
         if not self.supports_ranges and os.path.exists(self.part):
             os.remove(self.part)
+            if os.path.exists(self.meta):
+                os.remove(self.meta)
         if not self.supports_ranges or self.size <= 0 or self.threads == 1:
             self._sequential(progress_cb, cancel_check)
             return self.dest
@@ -678,7 +734,16 @@ def build_ui():
 
     if is_admin() is False and WIN:
         log("not admin — relaunching elevated")
-        relaunch_as_admin()
+        if not relaunch_as_admin():
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "T-Mobile Bypass needs Administrator rights to change the hop limit.\n\n"
+                    "Re-open the app and click Yes on the UAC prompt.",
+                    "T-Mobile Bypass", 0x10)
+            except Exception:
+                pass
         sys.exit(0)
 
     try:
@@ -1213,7 +1278,7 @@ def build_ui():
             cv3.addWidget(self.auto_update)
             v.addWidget(card3)
 
-            card4, cv4 = _card(page, "ABOUT")
+            card4, cv4 = _card(page, "ABOUT & LOGS")
             about = QLabel(
                 "Defeats T-Mobile's hotspot cap via TTL/hop-limit fix.\n"
                 "Only affects your own connection. Violates T-Mobile ToS.\n"
@@ -1221,6 +1286,13 @@ def build_ui():
             about.setStyleSheet(f"color:{MUTED}; font-size:11px;")
             about.setWordWrap(True)
             cv4.addWidget(about)
+            self.log_btn = QPushButton("Open log file")
+            self.log_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.08); color:{TEXT}; border:1px solid rgba(255,255,255,0.15);"
+                f" border-radius:9px; font-size:12px; font-weight:600; padding:8px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
+            self.log_btn.clicked.connect(self._open_log)
+            cv4.addWidget(self.log_btn)
             v.addWidget(card4)
 
             v.addStretch()
@@ -1364,6 +1436,19 @@ def build_ui():
         def _on_check_updates_toggle(self, checked):
             cfg["check_updates"] = bool(checked)
             _save_config(cfg)
+
+        def _open_log(self):
+            path = log_path()
+            if not os.path.exists(path):
+                QMessageBox.information(self, "Log", "No log file yet.")
+                return
+            if WIN:
+                try:
+                    os.startfile(path)
+                except Exception as e:
+                    QMessageBox.warning(self, "Log", f"Couldn't open log:\n{e}")
+            else:
+                QMessageBox.information(self, "Log", path)
 
         # ---- speed test ----
         def _on_speed(self):
