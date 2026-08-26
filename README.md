@@ -37,6 +37,25 @@ between your laptop and the phone.
     before/after side by side.
 12. **Self-update** — checks GitHub for new releases and swaps in the new build.
 13. **System tray icon** — minimize to tray with quick toggles.
+14. **On-wire TTL verification** — a `Verify on wire` button uses Windows
+    `pktmon` to observe the actual TTL leaving your NIC. The whole point is to
+    distinguish *configured* from *actual*, so a green ✓ means we saw the TTL
+    on the wire, not that the registry says so.
+15. **Per-SSID data usage counter** — tracks bytes per Wi-Fi SSID per billing
+    cycle so you can see how close you are to the throttle before you hit it.
+16. **TCP/IP stack masking** — an independently-toggleable sub-group in the
+    Hardening card: disable TCP timestamps, match a cellular MTU (1420 by
+    default), and (with a warning) restrict receive-window auto-tuning.
+17. **Auto re-detect on network change** — moving from direct-to-phone to
+    travel router silently changes the hop count; this notices the SSID /
+    gateway / adapter change and re-runs detection, re-applying the correct
+    TTL.
+18. **Travel-router rule export** — a copyable block of iptables/ip6tables
+    mangle rules for the case where the bypass has to live on the router
+    (OpenWRT, GL.iNet).
+19. **Phone-resolver DNS** — optional toggle to point the current Wi-Fi
+    adapter's DNS at the gateway, so a laptop querying 8.8.8.8 while "on a
+    phone" doesn't stand out.
 
 ## Supported carriers
 
@@ -95,6 +114,92 @@ value before touching it, and fail soft if the write is denied.
   that would give away a desktop. This key is owned by TrustedInstaller; if the
   write is refused the UI surfaces a clean skip message instead of crashing.
 
+## On-wire TTL verification
+
+The Bypass tab has a **Verify on wire** button. It uses `pktmon` (Windows 10
+1809+, requires admin — the app already runs elevated) to capture a real
+outbound packet, decode the ETL, and read the TTL as it actually leaves the
+NIC. This catches per-adapter overrides, VPNs, and failed `netsh` writes that
+otherwise show up as "green but broken".
+
+- ✓ **verified** — pktmon (or the optional probe) observed the exact expected
+  TTL leaving the NIC.
+- ✗ **mismatch** — observed TTL is different from the configured target.
+- **could not verify** — pktmon didn't return a TTL and no probe URL is set.
+  The app will *not* claim `verified` from the configured registry value.
+
+**Carrier-side confirmation.** `pktmon` verifies what leaves the NIC, not what
+the carrier sees. If you want end-to-end confirmation you can point
+`ttl_probe_url` at a VPS you control that echoes the TTL of the incoming
+packet as a bare integer or `{"ttl": N}` JSON. (Set it in Settings → USAGE /
+DETECTION.)
+
+## Per-SSID data usage tracking
+
+A `DATA USAGE` card on the Bypass tab tracks bytes per SSID per billing cycle
+using `Get-NetAdapterStatistics`. Counters are polled every 30 s and
+accumulated as **deltas** so adapter disable / reboot resets are handled — a
+current value lower than the previous snapshot is treated as a reset. Set the
+billing cycle start day (1–28) in Settings → USAGE / DETECTION. When a
+carrier profile is selected, the card also shows usage against the *low end*
+of that carrier's typical allotment (amber ≥ 80%, red ≥ 95%).
+
+## Stack masking
+
+The Hardening card has a `Stack masking` sub-group that groups three
+independently-toggleable TCP/IP stack tweaks — each saves its previous value
+before touching it, and every apply has a matching restore:
+
+1. **Disable TCP timestamps** —
+   `netsh int tcp set global timestamps=disabled`, restore `enabled`.
+2. **Match cellular MTU** —
+   `netsh interface ipv4 set subinterface "<Wi-Fi>" mtu=1420 store=persistent`
+   (spinbox 1280–1500), restore to the value read beforehand.
+3. **Restrict receive-window auto-tuning** —
+   `netsh int tcp set global autotuninglevel=restricted`, restore `normal`.
+   **Off by default** and labelled with its cost: it reduces the receive
+   window and can cut throughput on high-latency links. Not included in
+   `Apply stack masking`.
+
+`Apply stack masking` runs items 1 and 2 only. `Restore` undoes all three.
+
+## Auto re-detect on network change
+
+`network_signature()` returns `(ssid, gateway_ip, interface_alias)`. A 5-second
+timer watches for changes and, when it sees one, re-runs `detect_carrier()` and
+`detect_hop_count()` in a worker, writes the new `hop_count` to config, and if
+the bypass is currently active re-applies `bypass_ttl(cfg)` with the new
+value. A tray notification names the new target TTL. Guarded against thrash
+(one change per 15 s). Toggle in Settings → USAGE / DETECTION.
+
+## Travel-router rule export
+
+A `ROUTER RULES` card on the Settings tab exports iptables/ip6tables mangle
+rules for the case where the bypass has to live on the router:
+
+```
+iptables  -t mangle -I PREROUTING  -i usb0 -j TTL --ttl-set 65
+iptables  -t mangle -I POSTROUTING -o usb0 -j TTL --ttl-set 65
+ip6tables -t mangle -I PREROUTING  -i usb0 -j HL  --hl-set  65
+ip6tables -t mangle -I POSTROUTING -o usb0 -j HL  --hl-set  65
+…
+```
+
+Interfaces default to `usb0, usb1, eth1, eth2, wwan0, wlan0` and are editable.
+`Copy` puts the block on the clipboard, `Save .txt` writes a file. Paste into
+OpenWRT → Network → Firewall → Custom Rules (or the GL.iNet custom-rules box).
+**The router adds a hop**, so the laptop behind it should go back to the
+Windows default hop limit (128).
+
+## Phone-resolver DNS
+
+A `Use gateway as DNS (mimics phone-side resolver)` toggle in the Hardening
+card points the current Wi-Fi adapter's DNS at the gateway
+(`netsh interface ipv4 set dnsservers name="<Wi-Fi>" static <gw> primary`).
+The previous DNS setting is stored so `Restore` puts it back to DHCP (or the
+saved static list). Fails soft with a clear message if the adapter alias
+can't be resolved.
+
 ## Run
 
 **Option A — run as script (needs Python 3.11 + PySide6):**
@@ -108,7 +213,7 @@ It re-launches itself as Administrator automatically.
 ```
 build_exe.bat
 ```
-Output lands in `dist\T-MobileBypass.exe`.
+Output lands in `dist\CarrierBypass.exe`.
 
 **Start with Windows** — Settings → "Start with Windows" (launches minimized to tray).
 

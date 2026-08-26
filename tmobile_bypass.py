@@ -22,7 +22,7 @@ Carrier Bypass — Windows utility
 Run as Administrator (the .exe requests elevation via manifest; the .py
 re-launches itself elevated). The TTL setting persists across reboots.
 
-Logs: %APPDATA%\\T-MobileBypass\\tmobile_bypass.log  (crash dumps: CRASH.log)
+Logs: %APPDATA%\\CarrierBypass\\tmobile_bypass.log  (crash dumps: CRASH.log)
 """
 
 import os
@@ -36,6 +36,7 @@ import subprocess
 import traceback
 import tempfile
 import threading
+import datetime
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
@@ -49,8 +50,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 BYPASS_TTL = 65          # legacy constant — kept for back-compat; live code uses bypass_ttl()
 DEFAULT_TTL = 128        # Windows default hop limit
 
-VERSION = "1.2.0"
-GITHUB_REPO = "Predator04/T-MobileBypass"
+VERSION = "1.3.0"
+GITHUB_REPO = "Predator04/CarrierBypass"
 GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO
 
 WIN = sys.platform == "win32"
@@ -501,6 +502,613 @@ def restore_metered_wifi(cfg):
     log(f"restore_metered_wifi ok={ok} to={prev} detail={detail!r}")
     return (ok, detail)
 
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — stack-masking helpers (TCP timestamps, MTU, window auto-tuning)
+# ----------------------------------------------------------------------------
+
+def _netsh_tcp_global():
+    return _run(["netsh", "int", "tcp", "show", "global"]).stdout or ""
+
+
+def _read_tcp_timestamps():
+    """Return 'enabled' / 'disabled' / '' if unknown."""
+    out = _netsh_tcp_global()
+    m = re.search(r"Timestamps\s*:?\s*(\w+)", out, re.I)
+    if m:
+        return m.group(1).strip().lower()
+    return ""
+
+
+def _read_autotuning_level():
+    out = _netsh_tcp_global()
+    m = re.search(r"Receive\s+Window\s+Auto[-\s]?Tuning\s+Level\s*:?\s*(\w+)", out, re.I)
+    if m:
+        return m.group(1).strip().lower()
+    return ""
+
+
+def apply_disable_tcp_timestamps(cfg):
+    """netsh int tcp set global timestamps=disabled. Saves previous to cfg['prev_timestamps']."""
+    prev = _read_tcp_timestamps()
+    if prev:
+        cfg["prev_timestamps"] = prev
+    r = _run(["netsh", "int", "tcp", "set", "global", "timestamps=disabled"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"apply_disable_tcp_timestamps ok={ok} prev={prev} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def restore_tcp_timestamps(cfg):
+    # VERIFIED: on current Windows the default is `allowed`, not `enabled`
+    # (netsh reports "RFC 1323 Timestamps : allowed"). Omitting it here meant
+    # restore silently rewrote the machine's original value to `enabled`.
+    prev = (cfg.get("prev_timestamps") or "").strip().lower()
+    if prev not in ("enabled", "disabled", "allowed"):
+        prev = "allowed"
+    r = _run(["netsh", "int", "tcp", "set", "global", f"timestamps={prev}"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"restore_tcp_timestamps ok={ok} to={prev} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def _read_mtu(alias):
+    """Read the current MTU for the given interface alias, or None."""
+    if not alias:
+        return None
+    out = _run(["netsh", "interface", "ipv4", "show", "subinterfaces"]).stdout or ""
+    for line in out.splitlines():
+        parts = line.split()
+        # columns: MTU  MediaSenseState  BytesIn  BytesOut  Interface
+        if len(parts) >= 5 and parts[0].isdigit():
+            iface = " ".join(parts[4:]).strip()
+            if iface.lower() == alias.lower():
+                try:
+                    return int(parts[0])
+                except Exception:
+                    return None
+    return None
+
+
+def apply_cellular_mtu(cfg, alias=None, mtu=None):
+    """Set interface MTU to look cellular. Saves previous MTU to cfg['prev_mtu']."""
+    if alias is None:
+        alias = wifi_interface_alias()
+    if not alias:
+        return (False, "no Wi-Fi adapter alias resolved")
+    if mtu is None:
+        mtu = int(cfg.get("cellular_mtu") or 1420)
+    mtu = max(1280, min(1500, int(mtu)))
+    prev = _read_mtu(alias)
+    if prev is not None:
+        cfg["prev_mtu"] = int(prev)
+    r = _run(["netsh", "interface", "ipv4", "set", "subinterface", alias,
+              f"mtu={mtu}", "store=persistent"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"apply_cellular_mtu alias={alias!r} mtu={mtu} prev={prev} ok={ok} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def restore_mtu(cfg, alias=None):
+    if alias is None:
+        alias = wifi_interface_alias()
+    if not alias:
+        return (False, "no Wi-Fi adapter alias resolved")
+    prev = int(cfg.get("prev_mtu") or 1500)
+    if not (1280 <= prev <= 1500):
+        prev = 1500
+    r = _run(["netsh", "interface", "ipv4", "set", "subinterface", alias,
+              f"mtu={prev}", "store=persistent"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"restore_mtu alias={alias!r} to={prev} ok={ok} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def apply_autotuning_restricted(cfg):
+    """netsh int tcp set global autotuninglevel=restricted. Reduces receive window,
+    can cut throughput on high-latency links — keep OFF by default and never
+    include in an 'apply all'.
+    """
+    prev = _read_autotuning_level()
+    if prev:
+        cfg["prev_autotuning"] = prev
+    r = _run(["netsh", "int", "tcp", "set", "global", "autotuninglevel=restricted"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"apply_autotuning_restricted ok={ok} prev={prev} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def restore_autotuning(cfg):
+    prev = cfg.get("prev_autotuning") or "normal"
+    if prev not in ("disabled", "highlyrestricted", "restricted", "normal", "experimental"):
+        prev = "normal"
+    r = _run(["netsh", "int", "tcp", "set", "global", f"autotuninglevel={prev}"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"restore_autotuning ok={ok} to={prev} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — phone-resolver DNS (Feature 6)
+# ----------------------------------------------------------------------------
+
+def _read_dns_servers(alias):
+    """Return the comma-joined static DNS servers for alias, or '' if DHCP/unknown."""
+    if not alias:
+        return ""
+    out = _run(["netsh", "interface", "ipv4", "show", "dnsservers", f"name={alias}"]).stdout or ""
+    ips = re.findall(r"(\d{1,3}(?:\.\d{1,3}){3})", out)
+    if not ips:
+        return ""
+    if re.search(r"DHCP", out, re.I) and not re.search(r"Statically", out, re.I):
+        return ""
+    return ",".join(ips)
+
+
+def set_dns_to_gateway(cfg):
+    """Point the Wi-Fi adapter's DNS at the current gateway (mimics carrier DNS on phone).
+
+    Saves the previous DNS setting to cfg['prev_dns'] so restore is exact.
+    Returns (ok, detail). Never raises.
+    """
+    alias = wifi_interface_alias()
+    if not alias:
+        return (False, "no Wi-Fi adapter alias resolved")
+    gw = get_gateway_ip()
+    if not gw:
+        return (False, "no gateway IP resolved")
+    prev = _read_dns_servers(alias)
+    if prev:
+        cfg["prev_dns"] = prev
+    else:
+        cfg["prev_dns"] = ""  # was DHCP
+    r = _run(["netsh", "interface", "ipv4", "set", "dnsservers",
+              f"name={alias}", "static", gw, "primary"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"set_dns_to_gateway alias={alias!r} gw={gw} prev={prev!r} ok={ok} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+def restore_dns_dhcp(cfg):
+    """Restore the Wi-Fi adapter to DHCP DNS (or the saved previous static list)."""
+    alias = wifi_interface_alias()
+    if not alias:
+        return (False, "no Wi-Fi adapter alias resolved")
+    prev = (cfg.get("prev_dns") or "").strip()
+    if prev:
+        # restore explicit static list
+        ips = [ip.strip() for ip in prev.split(",") if ip.strip()]
+        if ips:
+            r = _run(["netsh", "interface", "ipv4", "set", "dnsservers",
+                      f"name={alias}", "static", ips[0], "primary"])
+            ok = r.returncode == 0
+            detail = ((r.stdout or "") + (r.stderr or "")).strip()
+            for i, ip in enumerate(ips[1:], start=2):
+                _run(["netsh", "interface", "ipv4", "add", "dnsservers",
+                      f"name={alias}", ip, f"index={i}"])
+            log(f"restore_dns_dhcp alias={alias!r} restored static={ips} ok={ok}")
+            return (ok, detail)
+    r = _run(["netsh", "interface", "ipv4", "set", "dnsservers",
+              f"name={alias}", "dhcp"])
+    ok = r.returncode == 0
+    detail = ((r.stdout or "") + (r.stderr or "")).strip()
+    log(f"restore_dns_dhcp alias={alias!r} → dhcp ok={ok} detail={detail[:120]!r}")
+    return (ok, detail)
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — Router rule export (Feature 5)
+# ----------------------------------------------------------------------------
+
+DEFAULT_ROUTER_INTERFACES = ["usb0", "usb1", "eth1", "eth2", "wwan0", "wlan0"]
+
+
+def router_rules(ttl, interfaces=None):
+    """Return a string of iptables/ip6tables mangle rules that rewrite the TTL/HL
+    on the given router interfaces. Four rules per interface (PREROUTING +
+    POSTROUTING, v4 + v6). Interfaces defaults to a common OpenWRT/GL.iNet set.
+    """
+    try:
+        ttl = int(ttl)
+    except Exception:
+        ttl = 65
+    ttl = max(1, min(255, ttl))
+    if interfaces is None:
+        interfaces = list(DEFAULT_ROUTER_INTERFACES)
+    lines = []
+    for iface in interfaces:
+        iface = str(iface).strip()
+        if not iface:
+            continue
+        lines.append(f"iptables  -t mangle -I PREROUTING  -i {iface} -j TTL --ttl-set {ttl}")
+        lines.append(f"iptables  -t mangle -I POSTROUTING -o {iface} -j TTL --ttl-set {ttl}")
+        lines.append(f"ip6tables -t mangle -I PREROUTING  -i {iface} -j HL  --hl-set  {ttl}")
+        lines.append(f"ip6tables -t mangle -I POSTROUTING -o {iface} -j HL  --hl-set  {ttl}")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — Wi-Fi adapter alias + counters (Feature 2 helpers, also used by 3/6)
+# ----------------------------------------------------------------------------
+
+def wifi_interface_alias():
+    """Return the Wi-Fi adapter's alias (e.g. 'Wi-Fi'), or None.
+
+    Tries `netsh wlan show interfaces` first, falls back to Get-NetAdapter.
+    """
+    if not WIN:
+        return None
+    try:
+        out = _run(["netsh", "wlan", "show", "interfaces"]).stdout or ""
+        m = re.search(r"^\s*Name\s*:\s*(.+)$", out, re.M)
+        if m:
+            return m.group(1).strip()
+    except Exception as e:
+        log(f"wifi_interface_alias netsh wlan failed: {e}")
+    try:
+        r = _run(["powershell", "-NoProfile", "-Command",
+                  "(Get-NetAdapter -Physical | Where-Object {$_.PhysicalMediaType -like '*802.11*' -and $_.Status -eq 'Up'} | Select-Object -First 1 -ExpandProperty Name)"])
+        name = (r.stdout or "").strip()
+        if name:
+            return name.splitlines()[-1].strip()
+    except Exception as e:
+        log(f"wifi_interface_alias powershell failed: {e}")
+    return None
+
+
+def read_adapter_counters(alias):
+    """Return (rx_bytes, tx_bytes) for the given adapter alias, or (None, None)."""
+    if not WIN or not alias:
+        return (None, None)
+    try:
+        cmd = ("Get-NetAdapterStatistics -Name '" + alias.replace("'", "''") +
+               "' | Select-Object -ExpandProperty ReceivedBytes; "
+               "Get-NetAdapterStatistics -Name '" + alias.replace("'", "''") +
+               "' | Select-Object -ExpandProperty SentBytes")
+        r = _run(["powershell", "-NoProfile", "-Command", cmd])
+        parts = [p.strip() for p in (r.stdout or "").splitlines() if p.strip()]
+        if len(parts) >= 2:
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except Exception:
+                pass
+        return (None, None)
+    except Exception as e:
+        log(f"read_adapter_counters({alias!r}) failed: {e}")
+        return (None, None)
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — Per-SSID usage tracking (Feature 2)
+# ----------------------------------------------------------------------------
+
+def _cycle_key(day, now=None):
+    """Return YYYY-MM key for the billing cycle that contains `now`.
+
+    day = billing start day (1..28). If today is before that day, we're still in
+    the previous month's cycle.
+    """
+    if now is None:
+        now = datetime.date.today()
+    try:
+        day = int(day)
+    except Exception:
+        day = 1
+    day = max(1, min(28, day))
+    y, m = now.year, now.month
+    if now.day < day:
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return f"{y:04d}-{m:02d}"
+
+
+def _load_usage():
+    try:
+        with open(_usage_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_usage(data):
+    p = _usage_path()
+    tmp = p + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def usage_add(ssid, cycle_start_day, rx_delta, tx_delta):
+    """Add rx/tx deltas to the current SSID+cycle bucket. Returns updated dict."""
+    if not ssid or (rx_delta <= 0 and tx_delta <= 0):
+        return _load_usage()
+    data = _load_usage()
+    key = _cycle_key(cycle_start_day)
+    bucket = data.setdefault(ssid, {}).setdefault(key, {"rx": 0, "tx": 0})
+    bucket["rx"] = int(bucket.get("rx", 0)) + int(max(0, rx_delta))
+    bucket["tx"] = int(bucket.get("tx", 0)) + int(max(0, tx_delta))
+    _save_usage(data)
+    return data
+
+
+def usage_current(ssid, cycle_start_day):
+    """Return (rx_bytes, tx_bytes) for this SSID's current cycle."""
+    if not ssid:
+        return (0, 0)
+    data = _load_usage()
+    key = _cycle_key(cycle_start_day)
+    b = data.get(ssid, {}).get(key) or {}
+    return (int(b.get("rx", 0)), int(b.get("tx", 0)))
+
+
+def usage_reset(ssid, cycle_start_day):
+    """Zero the current-cycle bucket for `ssid`."""
+    if not ssid:
+        return
+    data = _load_usage()
+    key = _cycle_key(cycle_start_day)
+    if ssid in data and key in data[ssid]:
+        data[ssid][key] = {"rx": 0, "tx": 0}
+        _save_usage(data)
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — Network signature (Feature 4)
+# ----------------------------------------------------------------------------
+
+def network_signature():
+    """Return (ssid, gateway_ip, interface_alias). Any component may be None.
+
+    Used to detect when the user has moved between phone-direct, travel-router,
+    etc. — the hop count and target TTL usually need to change with it.
+    """
+    try:
+        ssid = get_active_ssid()
+    except Exception:
+        ssid = None
+    try:
+        gw = get_gateway_ip()
+    except Exception:
+        gw = None
+    try:
+        alias = wifi_interface_alias()
+    except Exception:
+        alias = None
+    return (ssid, gw, alias)
+
+
+# ----------------------------------------------------------------------------
+# v1.3.0 — Egress TTL verification (Feature 1)
+# ----------------------------------------------------------------------------
+
+def _pktmon_help():
+    # VERIFIED: the correct form is `pktmon start help`. `--help` returns
+    # "Unknown parameter '--help'", which would poison any flag sniffing.
+    r = _run(["pktmon", "start", "help"])
+    return ((r.stdout or "") + (r.stderr or "")).lower()
+
+
+def _extract_ttl_from_pktmon_text(text):
+    """Parse the OUTBOUND IPv4 TTL out of `pktmon etl2txt --verbose` output.
+
+    Verified against a real capture on Windows build 26200. The decoded form is
+    three lines per packet:
+
+        [12]0004.0514::... [Microsoft-Windows-PktMon] PktGroupId ..., Direction Tx , ...
+        \tAA-.. > BB-.., ethertype IPv4 (0x0800), length 66: (tos 0x0, ttl 128, id 46774, ...)
+            192.168.1.8.14813 > 1.1.1.1.443: Flags [S], seq ..., win 65535, ...
+
+    Two things make the naive parse wrong:
+      1. The token is `ttl 128` — space separated, not `ttl=128`.
+      2. Direction lives on the PRECEDING line. Inbound packets from the target
+         carry the remote host's TTL (observed: 58). Grabbing the first TTL in
+         the file yields a confident, completely wrong answer.
+    Every packet is also logged once per component, so we take the most common
+    Tx value rather than the first.
+    """
+    if not text:
+        return None
+    counts = {}
+    direction_tx = False
+    for line in text.splitlines():
+        if "Direction" in line and "PktMon" in line:
+            direction_tx = "Direction Tx" in line
+            continue
+        if not direction_tx:
+            continue
+        m = re.search(r"\bttl\s+(\d{1,3})\b", line)
+        if not m:  # tolerate other decoder builds
+            m = re.search(r"\bttl\s*[=:]\s*(\d{1,3})\b", line, re.I)
+        if m:
+            v = int(m.group(1))
+            if 1 <= v <= 255:
+                counts[v] = counts.get(v, 0) + 1
+            direction_tx = False  # consume; next TTL needs a fresh direction line
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _pktmon_capture_ttl(dest_ip, timeout):
+    """Try to capture and decode the outbound TTL to dest_ip. Returns int or None.
+
+    Always cleans up filters and temp files.
+    """
+    if not WIN:
+        return (None, "not windows")
+    tmp_etl = os.path.join(tempfile.gettempdir(), "cbverify.etl")
+    tmp_txt = os.path.join(tempfile.gettempdir(), "cbverify.txt")
+    try:
+        _run(["pktmon", "stop"])
+        _run(["pktmon", "filter", "remove"])
+        _run(["pktmon", "filter", "add", "CBVerify", "-i", dest_ip, "-t", "TCP"])
+        # VERIFIED flag set for Windows 10 1809+ / 11. Fall back to the minimal
+        # form if this build rejects --comp/--pkt-size, rather than sniffing help
+        # text (which is fragile and was the original failure mode).
+        start_cmd = ["pktmon", "start", "--capture", "--comp", "nics",
+                     "--pkt-size", "128", "--file-name", tmp_etl]
+        r = _run(start_cmd)
+        if r.returncode != 0:
+            start_cmd = ["pktmon", "start", "--capture", "--file-name", tmp_etl]
+            r = _run(start_cmd)
+        if r.returncode != 0:
+            return (None, f"pktmon start failed: {((r.stdout or '') + (r.stderr or '')).strip()[:120]}")
+
+        # Generate outbound traffic so pktmon has something to see.
+        for _ in range(3):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                try:
+                    s.connect((dest_ip, 443))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        _run(["pktmon", "stop"])
+        if not os.path.exists(tmp_etl):
+            return (None, "pktmon did not produce an ETL file")
+        r2 = _run(["pktmon", "etl2txt", tmp_etl, "--out", tmp_txt, "--verbose"])
+        if r2.returncode != 0 or not os.path.exists(tmp_txt):
+            return (None, f"pktmon etl2txt failed: {((r2.stdout or '') + (r2.stderr or '')).strip()[:120]}")
+        try:
+            # VERIFIED: pktmon etl2txt writes UTF-16LE **with a BOM**. Reading it
+            # as UTF-8 yields zero matches and the whole feature silently reports
+            # "unavailable". Sniff the BOM instead of assuming an encoding.
+            with open(tmp_txt, "rb") as f:
+                raw = f.read()
+            if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                text = raw.decode("utf-16", errors="replace")
+            elif raw[:3] == b"\xef\xbb\xbf":
+                text = raw[3:].decode("utf-8", errors="replace")
+            else:
+                text = raw.decode("utf-8", errors="replace")
+                if "ttl" not in text.lower() and b"t\x00t\x00l\x00" in raw:
+                    text = raw.decode("utf-16-le", errors="replace")
+        except Exception as e:
+            return (None, f"could not read pktmon txt: {e}")
+        ttl = _extract_ttl_from_pktmon_text(text)
+        if ttl is None:
+            return (None, "no TTL parsed from pktmon output")
+        return (ttl, "ok")
+    finally:
+        try:
+            _run(["pktmon", "stop"])
+        except Exception:
+            pass
+        try:
+            _run(["pktmon", "filter", "remove"])
+        except Exception:
+            pass
+        for p in (tmp_etl, tmp_txt):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def _probe_ttl_endpoint(url, timeout):
+    """GET url and parse either a bare int body or a JSON {"ttl": N}."""
+    try:
+        req = Request(url, headers={"User-Agent": UA})
+        with urlopen(req, timeout=timeout) as r:
+            body = r.read(4096).decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        return (None, f"probe fetch failed: {e}")
+    try:
+        j = json.loads(body)
+        if isinstance(j, dict) and "ttl" in j:
+            v = int(j["ttl"])
+            if 1 <= v <= 255:
+                return (v, "ok")
+    except Exception:
+        pass
+    m = re.search(r"\b(\d{1,3})\b", body)
+    if m:
+        try:
+            v = int(m.group(1))
+            if 1 <= v <= 255:
+                return (v, "ok")
+        except Exception:
+            pass
+    return (None, "probe body did not contain a TTL")
+
+
+def verify_egress_ttl(dest_ip="1.1.1.1", timeout=12, cfg=None):
+    """Try to observe the real outbound TTL as it leaves the NIC.
+
+    Returns {"state": "verified"|"mismatch"|"unavailable",
+             "observed_ttl": int|None, "expected_ttl": int,
+             "method": "pktmon"|"probe"|None, "detail": "..."}
+
+    Never reports 'verified' from configured registry values — the whole point
+    is to distinguish configured from actual.
+    """
+    if cfg is None:
+        try:
+            cfg = _load_config()
+        except Exception:
+            cfg = {}
+    expected = bypass_ttl(cfg)
+
+    # 1. Try pktmon.
+    if WIN:
+        try:
+            ttl, detail = _pktmon_capture_ttl(dest_ip, timeout)
+        except Exception as e:
+            ttl, detail = (None, f"pktmon threw: {e}")
+        if ttl is not None:
+            state = "verified" if ttl == expected else "mismatch"
+            return {"state": state, "observed_ttl": int(ttl),
+                    "expected_ttl": int(expected), "method": "pktmon",
+                    "detail": f"pktmon observed TTL={ttl}, expected {expected}"}
+        pktmon_detail = detail or "pktmon produced no TTL"
+    else:
+        pktmon_detail = "not windows"
+
+    # 2. Fallback: custom probe endpoint.
+    probe_url = (cfg.get("ttl_probe_url") or "").strip()
+    if probe_url:
+        try:
+            ttl, detail = _probe_ttl_endpoint(probe_url, timeout)
+        except Exception as e:
+            ttl, detail = (None, f"probe threw: {e}")
+        if ttl is not None:
+            state = "verified" if ttl == expected else "mismatch"
+            return {"state": state, "observed_ttl": int(ttl),
+                    "expected_ttl": int(expected), "method": "probe",
+                    "detail": f"probe observed TTL={ttl}, expected {expected}"}
+        probe_detail = detail
+    else:
+        probe_detail = "no ttl_probe_url configured"
+
+    return {"state": "unavailable", "observed_ttl": None,
+            "expected_ttl": int(expected), "method": None,
+            "detail": f"could not verify: pktmon: {pktmon_detail}; probe: {probe_detail}"}
+
+
 # Common phone-hotspot SSIDs used for auto-detect. User can extend in Settings.
 DEFAULT_HOTSPOT_SSIDS = [
     "iphone", "androidap", "galaxy", "pixel", "oneplus", "hotspot",
@@ -524,17 +1132,51 @@ def _run(cmd):
 
 
 # ----------------------------------------------------------------------------
-# Config + history (JSON under %APPDATA%\T-MobileBypass)
+# Config + history (JSON under %APPDATA%\CarrierBypass, with one-time migration
+# from %APPDATA%\T-MobileBypass on first run of v1.3.0)
 # ----------------------------------------------------------------------------
 
+_MIGRATION_DONE = False
+
+
 def _data_dir():
+    global _MIGRATION_DONE
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "T-MobileBypass")
+    new = os.path.join(base, "CarrierBypass")
+    old = os.path.join(base, "T-MobileBypass")
     try:
-        os.makedirs(d, exist_ok=True)
-        return d
+        if not os.path.isdir(new):
+            if os.path.isdir(old) and not _MIGRATION_DONE:
+                try:
+                    os.makedirs(new, exist_ok=True)
+                    for fname in ("config.json", "history.json", "usage.json",
+                                  "tmobile_bypass.log", "tmobile_bypass.log.1"):
+                        src = os.path.join(old, fname)
+                        dst = os.path.join(new, fname)
+                        if os.path.exists(src) and not os.path.exists(dst):
+                            try:
+                                shutil.copy2(src, dst)
+                            except Exception:
+                                pass
+                    _MIGRATION_DONE = True
+                    return new
+                except Exception:
+                    _MIGRATION_DONE = True
+                    # copy failed — fall back to the old dir so the user keeps their data
+                    return old
+            os.makedirs(new, exist_ok=True)
+        return new
     except Exception:
+        try:
+            if os.path.isdir(old):
+                return old
+        except Exception:
+            pass
         return tempfile.gettempdir()
+
+
+def _usage_path():
+    return os.path.join(_data_dir(), "usage.json")
 
 
 def _config_path():
@@ -560,6 +1202,19 @@ def _load_config():
         # hardening
         "ncsi_disabled": False,
         "metered_wifi": False,
+        # v1.3.0
+        "ttl_probe_url": "",
+        "cycle_start_day": 1,
+        "auto_redetect": True,
+        "tcp_timestamps_disabled": False,
+        "mtu_masked": False,
+        "cellular_mtu": 1420,
+        "prev_mtu": 0,
+        "autotuning_restricted": False,
+        "prev_autotuning": "",
+        "dns_gateway": False,
+        "prev_dns": "",
+        "prev_timestamps": "",
     }
     try:
         with open(_config_path(), "r", encoding="utf-8") as f:
@@ -756,6 +1411,26 @@ def _startup_command():
     return f'"{pythonw}" "{_app_path()}" --minimized'
 
 
+def _cleanup_stale_startup_value():
+    """Delete a stale HKCU Run\\T-MobileBypass entry left over from the pre-rename build."""
+    if not WIN:
+        return
+    try:
+        import winreg
+    except Exception:
+        return
+    sub = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_SET_VALUE) as k:
+            try:
+                winreg.DeleteValue(k, "T-MobileBypass")
+                log("removed stale HKCU Run\\T-MobileBypass value (rename cleanup)")
+            except FileNotFoundError:
+                pass
+    except Exception as e:
+        log(f"_cleanup_stale_startup_value failed: {e}")
+
+
 def set_startup_enabled(enable):
     if not WIN:
         return False
@@ -768,12 +1443,18 @@ def set_startup_enabled(enable):
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_SET_VALUE) as k:
             if enable:
-                winreg.SetValueEx(k, "T-MobileBypass", 0, winreg.REG_SZ, _startup_command())
-            else:
+                winreg.SetValueEx(k, "CarrierBypass", 0, winreg.REG_SZ, _startup_command())
+                # also drop any old T-MobileBypass value so we don't start twice
                 try:
                     winreg.DeleteValue(k, "T-MobileBypass")
                 except FileNotFoundError:
                     pass
+            else:
+                for name in ("CarrierBypass", "T-MobileBypass"):
+                    try:
+                        winreg.DeleteValue(k, name)
+                    except FileNotFoundError:
+                        pass
         return True
     except Exception as e:
         log(f"set_startup_enabled({enable}) failed: {e}")
@@ -790,11 +1471,13 @@ def is_startup_enabled():
     sub = r"Software\Microsoft\Windows\CurrentVersion\Run"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_READ) as k:
-            try:
-                winreg.QueryValueEx(k, "T-MobileBypass")
-                return True
-            except FileNotFoundError:
-                return False
+            for name in ("CarrierBypass", "T-MobileBypass"):
+                try:
+                    winreg.QueryValueEx(k, name)
+                    return True
+                except FileNotFoundError:
+                    continue
+            return False
     except Exception:
         return False
 
@@ -1416,10 +2099,17 @@ def build_ui():
             self._queue_worker = None
             self._update_worker = None
             self._detect_worker = None
+            self._verify_worker = None
+            self._stack_worker = None
+            self._dns_worker = None
             self._bypass_test = None
             self._quitting = False
+            self._last_counters = None    # (alias, ssid, rx, tx)
+            self._last_signature = None
+            self._last_sig_change = 0.0
             self._build()
             self._build_tray()
+            _cleanup_stale_startup_value()
             log("app started")
 
         # ---- tray ----
@@ -1521,6 +2211,15 @@ def build_ui():
             self._hotspot_timer = QTimer(self)
             self._hotspot_timer.timeout.connect(self._hotspot_tick)
             self._hotspot_timer.start(10000)
+            # per-SSID data usage poll
+            self._usage_timer = QTimer(self)
+            self._usage_timer.timeout.connect(self._usage_tick)
+            self._usage_timer.start(30000)
+            QTimer.singleShot(2000, self._usage_tick)  # prime the counters
+            # network-change detector (feature 4)
+            self._netchange_timer = QTimer(self)
+            self._netchange_timer.timeout.connect(self._netchange_tick)
+            self._netchange_timer.start(5000)
 
         def _build_bypass_tab(self):
             page = QWidget()
@@ -1580,7 +2279,23 @@ def build_ui():
                 f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
             self.detect_btn.clicked.connect(self._on_detect_carrier)
             crow.addWidget(self.detect_btn)
+            self.verify_btn = QPushButton("Verify on wire")
+            self.verify_btn.setFixedHeight(32)
+            self.verify_btn.setToolTip(
+                "Uses pktmon to observe the actual TTL leaving your NIC "
+                "(not just the configured registry value).")
+            self.verify_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.08); color:{TEXT}; border:1px solid rgba(255,255,255,0.15);"
+                f" border-radius:9px; font-size:12px; font-weight:600; padding:0 12px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
+            self.verify_btn.clicked.connect(self._on_verify_egress)
+            crow.addWidget(self.verify_btn)
             v.addLayout(crow)
+
+            self.verify_label = QLabel("Verify: not yet checked")
+            self.verify_label.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            self.verify_label.setWordWrap(True)
+            v.addWidget(self.verify_label)
 
             self.bypass_test_btn = QPushButton("⚡ BYPASS + TEST  (before → after)")
             self.bypass_test_btn.setFixedHeight(40)
@@ -1613,6 +2328,36 @@ def build_ui():
             self.hotspot_auto.toggled.connect(self._on_hotspot_auto)
             cv2.addWidget(self.hotspot_auto)
             v.addWidget(card2)
+
+            # DATA USAGE (per-SSID, per-cycle)
+            card_du, cv_du = _card(page, "DATA USAGE")
+            self.usage_ssid_label = QLabel("SSID: —")
+            self.usage_ssid_label.setStyleSheet(f"color:{MUTED}; font-size:12px;")
+            cv_du.addWidget(self.usage_ssid_label)
+            self.usage_value_label = QLabel("0.0 GB used this cycle")
+            self.usage_value_label.setStyleSheet(f"color:{TEXT}; font-size:16px; font-weight:700;")
+            cv_du.addWidget(self.usage_value_label)
+            self.usage_pbar = QProgressBar()
+            self.usage_pbar.setRange(0, 100)
+            self.usage_pbar.setTextVisible(False)
+            self.usage_pbar.setFixedHeight(6)
+            self.usage_pbar.setStyleSheet(
+                f"QProgressBar {{ background:rgba(0,0,0,0.3); border:none; border-radius:3px; }}\n"
+                f"QProgressBar::chunk {{ background:{ACCENT}; border-radius:3px; }}")
+            cv_du.addWidget(self.usage_pbar)
+            self.usage_note_label = QLabel("")
+            self.usage_note_label.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            self.usage_note_label.setWordWrap(True)
+            cv_du.addWidget(self.usage_note_label)
+            self.usage_reset_btn = QPushButton("Reset cycle")
+            self.usage_reset_btn.setFixedHeight(28)
+            self.usage_reset_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.06); color:{MUTED}; border:none;"
+                f" border-radius:8px; font-size:11px; padding:0 12px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.10); color:{TEXT}; }}")
+            self.usage_reset_btn.clicked.connect(self._on_usage_reset)
+            cv_du.addWidget(self.usage_reset_btn)
+            v.addWidget(card_du)
 
             v.addStretch()
             self.tabs.addTab(page, "Bypass")
@@ -1807,11 +2552,108 @@ def build_ui():
             metered_note.setWordWrap(True)
             cv_hard.addWidget(metered_note)
 
+            # ---- Stack masking sub-group ----
+            sm_title = QLabel("Stack masking")
+            sm_title.setStyleSheet(f"color:{MUTED}; font-size:11px; letter-spacing:1px; font-weight:600; margin-top:4px;")
+            cv_hard.addWidget(sm_title)
+
+            self.chk_tstamp = QCheckBox("Disable TCP timestamps")
+            self.chk_tstamp.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_tstamp.setChecked(bool(cfg.get("tcp_timestamps_disabled")))
+            self.chk_tstamp.toggled.connect(self._on_tstamp_toggle)
+            cv_hard.addWidget(self.chk_tstamp)
+
+            mtu_row = QHBoxLayout()
+            self.chk_mtu = QCheckBox("Match cellular MTU")
+            self.chk_mtu.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_mtu.setChecked(bool(cfg.get("mtu_masked")))
+            self.chk_mtu.toggled.connect(self._on_mtu_toggle)
+            mtu_row.addWidget(self.chk_mtu)
+            mtu_row.addStretch()
+            self.mtu_spin = QSpinBox()
+            self.mtu_spin.setRange(1280, 1500)
+            self.mtu_spin.setValue(int(cfg.get("cellular_mtu") or 1420))
+            self.mtu_spin.setStyleSheet(spinstyle)
+            self.mtu_spin.valueChanged.connect(self._on_mtu_value_changed)
+            mtu_row.addWidget(self.mtu_spin)
+            cv_hard.addLayout(mtu_row)
+
+            self.chk_autotune = QCheckBox("Restrict receive-window auto-tuning (⚠ cuts throughput on high-latency links)")
+            self.chk_autotune.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_autotune.setChecked(bool(cfg.get("autotuning_restricted")))
+            self.chk_autotune.toggled.connect(self._on_autotune_toggle)
+            cv_hard.addWidget(self.chk_autotune)
+
+            stack_row = QHBoxLayout()
+            self.stack_apply_btn = QPushButton("Apply stack masking")
+            self.stack_apply_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.08); color:{TEXT}; border:1px solid rgba(255,255,255,0.15);"
+                f" border-radius:9px; font-size:11px; font-weight:600; padding:6px 10px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
+            self.stack_apply_btn.clicked.connect(self._on_stack_apply)
+            stack_row.addWidget(self.stack_apply_btn)
+            self.stack_restore_btn = QPushButton("Restore")
+            self.stack_restore_btn.setStyleSheet(self.stack_apply_btn.styleSheet())
+            self.stack_restore_btn.clicked.connect(self._on_stack_restore)
+            stack_row.addWidget(self.stack_restore_btn)
+            stack_row.addStretch()
+            cv_hard.addLayout(stack_row)
+
+            # ---- Phone-resolver DNS ----
+            dns_title = QLabel("Phone-resolver DNS")
+            dns_title.setStyleSheet(f"color:{MUTED}; font-size:11px; letter-spacing:1px; font-weight:600; margin-top:4px;")
+            cv_hard.addWidget(dns_title)
+            self.chk_dns = QCheckBox("Use gateway as DNS (mimics phone-side resolver)")
+            self.chk_dns.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_dns.setChecked(bool(cfg.get("dns_gateway")))
+            self.chk_dns.toggled.connect(self._on_dns_toggle)
+            cv_hard.addWidget(self.chk_dns)
+            dns_note = QLabel(
+                "Only applies to the current Wi-Fi adapter; reverts to DHCP on restore. "
+                "A laptop querying 8.8.8.8 while 'on a phone' is a tell — phones use carrier DNS.")
+            dns_note.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            dns_note.setWordWrap(True)
+            cv_hard.addWidget(dns_note)
+
             self.hardening_status = QLabel("")
             self.hardening_status.setStyleSheet(f"color:{MUTED}; font-size:11px;")
             self.hardening_status.setWordWrap(True)
             cv_hard.addWidget(self.hardening_status)
             v.addWidget(card_hard)
+
+            # ---- Billing cycle + auto redetect + TTL probe URL ----
+            card_cy, cv_cy = _card(page, "USAGE / DETECTION")
+            cy_row = QHBoxLayout()
+            cy_lbl = QLabel("Billing cycle start day (1–28)")
+            cy_lbl.setStyleSheet(f"color:{TEXT}; font-size:12px;")
+            self.cycle_spin = QSpinBox()
+            self.cycle_spin.setRange(1, 28)
+            self.cycle_spin.setValue(int(cfg.get("cycle_start_day") or 1))
+            self.cycle_spin.setStyleSheet(spinstyle)
+            self.cycle_spin.valueChanged.connect(self._on_cycle_changed)
+            cy_row.addWidget(cy_lbl); cy_row.addStretch(); cy_row.addWidget(self.cycle_spin)
+            cv_cy.addLayout(cy_row)
+
+            self.chk_auto_redetect = QCheckBox("Re-detect carrier + hop count on network change")
+            self.chk_auto_redetect.setStyleSheet(f"QCheckBox {{ color:{TEXT}; font-size:12px; spacing:8px; }}")
+            self.chk_auto_redetect.setChecked(bool(cfg.get("auto_redetect", True)))
+            self.chk_auto_redetect.toggled.connect(self._on_auto_redetect_toggle)
+            cv_cy.addWidget(self.chk_auto_redetect)
+
+            probe_lbl = QLabel("TTL probe URL (optional — a VPS endpoint that echoes the TTL of the incoming packet)")
+            probe_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            probe_lbl.setWordWrap(True)
+            cv_cy.addWidget(probe_lbl)
+            self.probe_edit = QLineEdit()
+            self.probe_edit.setText(cfg.get("ttl_probe_url") or "")
+            self.probe_edit.setPlaceholderText("https://your-vps.example/ttl")
+            self.probe_edit.setStyleSheet(
+                f"QLineEdit {{ background:rgba(0,0,0,0.3); color:{TEXT}; border:1px solid rgba(255,255,255,0.1);"
+                f" border-radius:9px; padding:6px; font-size:11px; }}\n"
+                f"QLineEdit:focus {{ border:1px solid {ACCENT}; }}")
+            self.probe_edit.editingFinished.connect(self._on_probe_url_changed)
+            cv_cy.addWidget(self.probe_edit)
+            v.addWidget(card_cy)
 
             card2, cv2 = _card(page, "HOTSPOT SSIDs (auto-detect)")
             self.ssid_edit = QLineEdit()
@@ -1848,6 +2690,60 @@ def build_ui():
             self.auto_update.toggled.connect(self._on_check_updates_toggle)
             cv3.addWidget(self.auto_update)
             v.addWidget(card3)
+
+            # ---- Router rule export ----
+            from PySide6.QtWidgets import QPlainTextEdit, QFileDialog  # local import
+            card_rr, cv_rr = _card(page, "ROUTER RULES  (OpenWRT / GL.iNet)")
+            rr_lbl = QLabel(
+                "Paste these into your router's custom rules box (OpenWRT: Network → Firewall → "
+                "Custom Rules). The router adds a hop, so the laptop behind it should go back to "
+                "the Windows default hop limit (128).")
+            rr_lbl.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+            rr_lbl.setWordWrap(True)
+            cv_rr.addWidget(rr_lbl)
+
+            rr_if_row = QHBoxLayout()
+            rr_if_lbl = QLabel("Interfaces:")
+            rr_if_lbl.setStyleSheet(f"color:{TEXT}; font-size:12px;")
+            rr_if_row.addWidget(rr_if_lbl)
+            self.rr_ifaces = QLineEdit()
+            self.rr_ifaces.setText(", ".join(DEFAULT_ROUTER_INTERFACES))
+            self.rr_ifaces.setStyleSheet(
+                f"QLineEdit {{ background:rgba(0,0,0,0.3); color:{TEXT}; border:1px solid rgba(255,255,255,0.1);"
+                f" border-radius:9px; padding:6px; font-size:11px; }}\n"
+                f"QLineEdit:focus {{ border:1px solid {ACCENT}; }}")
+            self.rr_ifaces.editingFinished.connect(self._refresh_router_rules)
+            rr_if_row.addWidget(self.rr_ifaces, 1)
+            cv_rr.addLayout(rr_if_row)
+
+            self.rr_text = QPlainTextEdit()
+            self.rr_text.setReadOnly(True)
+            self.rr_text.setStyleSheet(
+                f"QPlainTextEdit {{ background:rgba(0,0,0,0.35); color:{TEXT};"
+                f" border:1px solid rgba(255,255,255,0.08); border-radius:9px;"
+                f" font-family:'Consolas','Courier New',monospace; font-size:11px; padding:6px; }}")
+            self.rr_text.setMinimumHeight(120)
+            cv_rr.addWidget(self.rr_text)
+
+            rr_btn_row = QHBoxLayout()
+            self.rr_copy_btn = QPushButton("Copy")
+            self.rr_copy_btn.setStyleSheet(
+                f"QPushButton {{ background:{ACCENT}; color:#06231d; border:none; border-radius:8px;"
+                f" font-size:11px; font-weight:700; padding:6px 12px; }}\n"
+                f"QPushButton:hover {{ background:#00e8bb; }}")
+            self.rr_copy_btn.clicked.connect(self._copy_router_rules)
+            rr_btn_row.addWidget(self.rr_copy_btn)
+            self.rr_save_btn = QPushButton("Save .txt")
+            self.rr_save_btn.setStyleSheet(
+                f"QPushButton {{ background:rgba(255,255,255,0.08); color:{TEXT}; border:1px solid rgba(255,255,255,0.15);"
+                f" border-radius:8px; font-size:11px; font-weight:600; padding:6px 12px; }}\n"
+                f"QPushButton:hover {{ background:rgba(255,255,255,0.12); }}")
+            self.rr_save_btn.clicked.connect(lambda: self._save_router_rules(QFileDialog))
+            rr_btn_row.addWidget(self.rr_save_btn)
+            rr_btn_row.addStretch()
+            cv_rr.addLayout(rr_btn_row)
+            v.addWidget(card_rr)
+            self._refresh_router_rules()
 
             card4, cv4 = _card(page, "ABOUT & LOGS")
             about = QLabel(
@@ -1902,7 +2798,8 @@ def build_ui():
         def closeEvent(self, e):
             if self._quitting:
                 for w in (self._speed_worker, self._dl_worker, self._queue_worker,
-                          self._update_worker, self._detect_worker):
+                          self._update_worker, self._detect_worker,
+                          self._verify_worker, self._stack_worker, self._dns_worker):
                     if w is not None and w.isRunning():
                         w.wait(3000)
                 super().closeEvent(e)
@@ -1966,6 +2863,15 @@ def build_ui():
             self.conn_label.setText(f"Connection: {host} ({ip})")
             ssid = get_active_ssid()
             self.ssid_label.setText(f"Wi-Fi: {ssid or '—'}")
+            # keep router rules and data-usage card in sync with the current target TTL
+            try:
+                self._refresh_router_rules()
+            except Exception:
+                pass
+            try:
+                self._refresh_usage_ui(ssid)
+            except Exception:
+                pass
 
         def _watchdog_tick(self):
             if cfg.get("auto_bypass"):
@@ -2313,6 +3219,367 @@ def build_ui():
             self.pbar.setValue(100)
             self.dl_info.setText("✓ Queue complete")
 
+        # ---- verify on wire (feature 1) ----
+        def _on_verify_egress(self):
+            self.verify_btn.setEnabled(False)
+            self.verify_label.setText("Verifying on wire…")
+            self.verify_label.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+
+            cfg_snap = dict(cfg)
+
+            def _do():
+                return verify_egress_ttl(cfg=cfg_snap)
+
+            def _done(res):
+                self.verify_btn.setEnabled(True)
+                if res[0] != "ok":
+                    self.verify_label.setText(f"Verify: could not verify ({str(res[1])[:80]})")
+                    self.verify_label.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+                    return
+                d = res[1] or {}
+                st = d.get("state")
+                obs = d.get("observed_ttl")
+                exp = d.get("expected_ttl")
+                meth = d.get("method") or "?"
+                if st == "verified":
+                    self.verify_label.setText(f"Verify: ✓ verified on wire (TTL {obs}, via {meth})")
+                    self.verify_label.setStyleSheet(f"color:{ACCENT}; font-size:11px; font-weight:600;")
+                elif st == "mismatch":
+                    self.verify_label.setText(
+                        f"Verify: ✗ mismatch — observed TTL {obs}, expected {exp} (via {meth})")
+                    self.verify_label.setStyleSheet(f"color:{BAD}; font-size:11px; font-weight:600;")
+                else:
+                    self.verify_label.setText(f"Verify: could not verify — {d.get('detail','')[:140]}")
+                    self.verify_label.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+
+            self._verify_worker = Worker(_do)
+            self._verify_worker.done.connect(_done)
+            self._verify_worker.start()
+
+        # ---- data usage (feature 2) ----
+        def _usage_tick(self):
+            alias = wifi_interface_alias()
+            ssid = get_active_ssid()
+            if not alias:
+                self._last_counters = None
+                self._refresh_usage_ui(ssid)
+                return
+            rx, tx = read_adapter_counters(alias)
+            if rx is None or tx is None:
+                self._last_counters = None
+                self._refresh_usage_ui(ssid)
+                return
+            prev = self._last_counters
+            if prev and prev[0] == alias and prev[1] == ssid:
+                d_rx = rx - prev[2]
+                d_tx = tx - prev[3]
+                # counter reset (adapter disable/reboot): use current value as delta
+                if d_rx < 0:
+                    d_rx = rx
+                if d_tx < 0:
+                    d_tx = tx
+                if ssid and (d_rx > 0 or d_tx > 0):
+                    try:
+                        usage_add(ssid, cfg.get("cycle_start_day", 1), d_rx, d_tx)
+                    except Exception as e:
+                        log(f"usage_add failed: {e}")
+            self._last_counters = (alias, ssid, rx, tx)
+            self._refresh_usage_ui(ssid)
+
+        def _refresh_usage_ui(self, ssid):
+            if not hasattr(self, "usage_ssid_label"):
+                return
+            self.usage_ssid_label.setText(f"SSID: {ssid or '—'}")
+            rx, tx = usage_current(ssid, cfg.get("cycle_start_day", 1)) if ssid else (0, 0)
+            gb = (rx + tx) / (1024 ** 3)
+            cid = self._current_carrier_id()
+            prof = carrier_profile(cid)
+            allot = prof.get("typical_allotment_gb") or []
+            low = allot[0] if allot else None
+            if low:
+                self.usage_value_label.setText(f"{gb:.2f} / {low} GB  this cycle")
+                pct = min(100, int(gb / low * 100)) if low else 0
+                self.usage_pbar.setValue(pct)
+                if pct >= 95:
+                    color = BAD
+                elif pct >= 80:
+                    color = WARN
+                else:
+                    color = ACCENT
+                self.usage_pbar.setStyleSheet(
+                    f"QProgressBar {{ background:rgba(0,0,0,0.3); border:none; border-radius:3px; }}\n"
+                    f"QProgressBar::chunk {{ background:{color}; border-radius:3px; }}")
+                self.usage_note_label.setText(
+                    f"{prof.get('name','?')} low-end allotment: {low} GB · cycle starts day "
+                    f"{cfg.get('cycle_start_day',1)}")
+            else:
+                self.usage_value_label.setText(f"{gb:.2f} GB used this cycle")
+                self.usage_pbar.setValue(0)
+                self.usage_note_label.setText(
+                    f"cycle starts day {cfg.get('cycle_start_day',1)} · no allotment recorded for {prof.get('name','?')}")
+
+        def _on_usage_reset(self):
+            ssid = get_active_ssid()
+            if not ssid:
+                QMessageBox.information(self, "Data usage", "No active Wi-Fi SSID — nothing to reset.")
+                return
+            r = QMessageBox.question(
+                self, "Reset cycle",
+                f"Zero the current-cycle counter for '{ssid}'?",
+                QMessageBox.Yes | QMessageBox.No)
+            if r != QMessageBox.Yes:
+                return
+            usage_reset(ssid, cfg.get("cycle_start_day", 1))
+            self._last_counters = None  # re-baseline
+            self._refresh_usage_ui(ssid)
+
+        def _on_cycle_changed(self, value):
+            cfg["cycle_start_day"] = int(value)
+            _save_config(cfg)
+            self._refresh_usage_ui(get_active_ssid())
+
+        # ---- stack masking (feature 3) ----
+        def _stack_status(self, ok, detail, ok_msg):
+            if ok:
+                self.hardening_status.setText(ok_msg)
+                self.hardening_status.setStyleSheet(f"color:{ACCENT}; font-size:11px;")
+            else:
+                self.hardening_status.setText(f"{ok_msg.split('.')[0]} failed: {str(detail)[:160]}")
+                self.hardening_status.setStyleSheet(f"color:{WARN}; font-size:11px;")
+
+        def _on_tstamp_toggle(self, checked):
+            try:
+                if checked:
+                    ok, detail = apply_disable_tcp_timestamps(cfg)
+                else:
+                    ok, detail = restore_tcp_timestamps(cfg)
+            except Exception as e:
+                ok, detail = (False, str(e))
+            cfg["tcp_timestamps_disabled"] = bool(checked and ok)
+            _save_config(cfg)
+            if not ok:
+                self.chk_tstamp.blockSignals(True)
+                self.chk_tstamp.setChecked(not checked)
+                self.chk_tstamp.blockSignals(False)
+            self._stack_status(ok, detail,
+                               "TCP timestamps disabled." if checked else "TCP timestamps restored.")
+
+        def _on_mtu_toggle(self, checked):
+            try:
+                if checked:
+                    ok, detail = apply_cellular_mtu(cfg, mtu=self.mtu_spin.value())
+                else:
+                    ok, detail = restore_mtu(cfg)
+            except Exception as e:
+                ok, detail = (False, str(e))
+            cfg["mtu_masked"] = bool(checked and ok)
+            _save_config(cfg)
+            if not ok:
+                self.chk_mtu.blockSignals(True)
+                self.chk_mtu.setChecked(not checked)
+                self.chk_mtu.blockSignals(False)
+            self._stack_status(ok, detail,
+                               f"MTU set to {self.mtu_spin.value()}." if checked else "MTU restored.")
+
+        def _on_mtu_value_changed(self, value):
+            cfg["cellular_mtu"] = int(value)
+            _save_config(cfg)
+            # if already applied, re-apply with new value
+            if cfg.get("mtu_masked"):
+                try:
+                    ok, detail = apply_cellular_mtu(cfg, mtu=int(value))
+                    self._stack_status(ok, detail, f"MTU updated to {value}.")
+                except Exception as e:
+                    log(f"_on_mtu_value_changed re-apply failed: {e}")
+
+        def _on_autotune_toggle(self, checked):
+            try:
+                if checked:
+                    ok, detail = apply_autotuning_restricted(cfg)
+                else:
+                    ok, detail = restore_autotuning(cfg)
+            except Exception as e:
+                ok, detail = (False, str(e))
+            cfg["autotuning_restricted"] = bool(checked and ok)
+            _save_config(cfg)
+            if not ok:
+                self.chk_autotune.blockSignals(True)
+                self.chk_autotune.setChecked(not checked)
+                self.chk_autotune.blockSignals(False)
+            self._stack_status(ok, detail,
+                               "Auto-tuning restricted." if checked else "Auto-tuning restored.")
+
+        def _on_stack_apply(self):
+            """Apply items 1 and 2 (timestamps + MTU) — never auto-tuning."""
+            def _do():
+                r1 = apply_disable_tcp_timestamps(cfg)
+                r2 = apply_cellular_mtu(cfg, mtu=self.mtu_spin.value())
+                return (r1, r2)
+
+            def _done(res):
+                if res[0] != "ok":
+                    self._stack_status(False, res[1], "Apply stack masking")
+                    return
+                r1, r2 = res[1]
+                ok = bool(r1[0]) and bool(r2[0])
+                cfg["tcp_timestamps_disabled"] = bool(r1[0])
+                cfg["mtu_masked"] = bool(r2[0])
+                _save_config(cfg)
+                self.chk_tstamp.blockSignals(True); self.chk_tstamp.setChecked(bool(r1[0])); self.chk_tstamp.blockSignals(False)
+                self.chk_mtu.blockSignals(True); self.chk_mtu.setChecked(bool(r2[0])); self.chk_mtu.blockSignals(False)
+                self._stack_status(ok, (r1[1] or "") + " | " + (r2[1] or ""),
+                                   "Stack masking applied (timestamps + MTU).")
+
+            self._stack_worker = Worker(_do)
+            self._stack_worker.done.connect(_done)
+            self._stack_worker.start()
+
+        def _on_stack_restore(self):
+            def _do():
+                r1 = restore_tcp_timestamps(cfg)
+                r2 = restore_mtu(cfg)
+                r3 = restore_autotuning(cfg) if cfg.get("autotuning_restricted") else (True, "not applied")
+                return (r1, r2, r3)
+
+            def _done(res):
+                if res[0] != "ok":
+                    self._stack_status(False, res[1], "Restore stack masking")
+                    return
+                r1, r2, r3 = res[1]
+                cfg["tcp_timestamps_disabled"] = False
+                cfg["mtu_masked"] = False
+                cfg["autotuning_restricted"] = False
+                _save_config(cfg)
+                for chk in (self.chk_tstamp, self.chk_mtu, self.chk_autotune):
+                    chk.blockSignals(True); chk.setChecked(False); chk.blockSignals(False)
+                self._stack_status(True, "", "Stack masking restored.")
+
+            self._stack_worker = Worker(_do)
+            self._stack_worker.done.connect(_done)
+            self._stack_worker.start()
+
+        # ---- phone-resolver DNS (feature 6) ----
+        def _on_dns_toggle(self, checked):
+            def _do():
+                return set_dns_to_gateway(cfg) if checked else restore_dns_dhcp(cfg)
+
+            def _done(res):
+                if res[0] != "ok":
+                    ok, detail = (False, str(res[1]))
+                else:
+                    ok, detail = res[1]
+                cfg["dns_gateway"] = bool(checked and ok)
+                _save_config(cfg)
+                if not ok:
+                    self.chk_dns.blockSignals(True)
+                    self.chk_dns.setChecked(not checked)
+                    self.chk_dns.blockSignals(False)
+                    self.hardening_status.setText(f"DNS toggle failed: {detail[:160]}")
+                    self.hardening_status.setStyleSheet(f"color:{WARN}; font-size:11px;")
+                else:
+                    if checked:
+                        gw = get_gateway_ip() or "?"
+                        prev = cfg.get("prev_dns") or "DHCP"
+                        self.hardening_status.setText(f"DNS → {gw} (was {prev}).")
+                    else:
+                        self.hardening_status.setText("DNS restored to DHCP.")
+                    self.hardening_status.setStyleSheet(f"color:{ACCENT}; font-size:11px;")
+
+            self._dns_worker = Worker(_do)
+            self._dns_worker.done.connect(_done)
+            self._dns_worker.start()
+
+        # ---- network change (feature 4) ----
+        def _netchange_tick(self):
+            if not cfg.get("auto_redetect", True):
+                return
+            sig = network_signature()
+            if self._last_signature is None:
+                self._last_signature = sig
+                return
+            if sig == self._last_signature:
+                return
+            now = time.time()
+            if (now - self._last_sig_change) < 15:
+                return  # anti-thrash
+            self._last_sig_change = now
+            old = self._last_signature
+            self._last_signature = sig
+            log(f"network change: {old} → {sig}")
+
+            def _do():
+                return (detect_carrier(), detect_hop_count())
+
+            def _done(res):
+                if res[0] != "ok":
+                    return
+                (cid, detail, cerr), (hops, ttl, hop_ips) = res[1]
+                cfg["hop_count"] = int(hops)
+                _save_config(cfg)
+                if hasattr(self, "hop_spin"):
+                    self.hop_spin.blockSignals(True)
+                    self.hop_spin.setValue(int(hops))
+                    self.hop_spin.blockSignals(False)
+                target = bypass_ttl(cfg)
+                hl = get_hoplimit()
+                if hl is not None and hl != DEFAULT_TTL and hl != target:
+                    ok, _ = set_hoplimit(target)
+                    log(f"network change re-apply: ttl={target} ok={ok}")
+                self._refresh()
+                self._last_counters = None  # different SSID / adapter → re-baseline
+                try:
+                    self.tray.showMessage(
+                        "Carrier Bypass",
+                        f"Network changed → hops={hops}, target TTL {target}",
+                        QSystemTrayIcon.Information, 3000)
+                except Exception:
+                    pass
+
+            self._detect_worker = Worker(_do)
+            self._detect_worker.done.connect(_done)
+            self._detect_worker.start()
+
+        def _on_auto_redetect_toggle(self, checked):
+            cfg["auto_redetect"] = bool(checked)
+            _save_config(cfg)
+
+        def _on_probe_url_changed(self):
+            url = self.probe_edit.text().strip()
+            cfg["ttl_probe_url"] = url
+            _save_config(cfg)
+
+        # ---- router rules (feature 5) ----
+        def _current_router_interfaces(self):
+            parts = [p.strip() for p in self.rr_ifaces.text().split(",") if p.strip()]
+            return parts or list(DEFAULT_ROUTER_INTERFACES)
+
+        def _refresh_router_rules(self):
+            if not hasattr(self, "rr_text"):
+                return
+            ttl = bypass_ttl(cfg)
+            self.rr_text.setPlainText(router_rules(ttl, self._current_router_interfaces()))
+
+        def _copy_router_rules(self):
+            try:
+                QApplication.clipboard().setText(self.rr_text.toPlainText())
+                self.rr_copy_btn.setText("Copied ✓")
+                QTimer.singleShot(1500, lambda: self.rr_copy_btn.setText("Copy"))
+            except Exception as e:
+                log(f"clipboard set failed: {e}")
+
+        def _save_router_rules(self, QFileDialog):
+            try:
+                default = os.path.join(os.path.expanduser("~"), "Downloads", "carrier_bypass_router_rules.txt")
+                path, _f = QFileDialog.getSaveFileName(self, "Save router rules", default, "Text (*.txt)")
+                if not path:
+                    return
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(self.rr_text.toPlainText())
+                self.rr_save_btn.setText("Saved ✓")
+                QTimer.singleShot(1500, lambda: self.rr_save_btn.setText("Save .txt"))
+            except Exception as e:
+                log(f"save router rules failed: {e}")
+
         # ---- self-update ----
         def _auto_check_update(self):
             self._check_update(silent=True)
@@ -2364,7 +3631,7 @@ def build_ui():
             if r != QMessageBox.Yes:
                 return
             self.update_label.setText(f"Downloading {latest}…")
-            new_exe = os.path.join(tempfile.gettempdir(), "T-MobileBypass-new.exe")
+            new_exe = os.path.join(tempfile.gettempdir(), "CarrierBypass-new.exe")
 
             def dl_done(res):
                 if res[0] == "ok" and res[1]:
