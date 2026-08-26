@@ -1,0 +1,8 @@
+# PyInstaller build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.exe
+*.log
+CRASH.log
